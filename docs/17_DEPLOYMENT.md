@@ -10,9 +10,36 @@ Cloudflare Pages (Vite 정적 파일)
 Node WebSocket 서버 (Docker: Fly.io / Render / Railway 등)
 ```
 
-Pages는 정적 클라이언트를 배포하고, 방 코드·매칭·실시간 상태는 별도 WebSocket 서버가 처리한다. 이 프로젝트는 서버 권위 물리 시뮬레이션을 추가할 예정이므로, 시범 단계에서는 Node 서버를 별도 컨테이너로 유지한다.
+Pages는 정적 클라이언트를 배포하고, 방 코드·매칭·실시간 상태와 서버 권위 물리는 별도 WebSocket 서버가 처리한다. 시범 단계에서는 이 Node 서버를 별도 컨테이너로 유지한다.
 
 Cloudflare만으로 구성할 수도 있지만, 그 경우 Pages 외에 **Worker + Durable Object**를 별도 배포해야 한다. Pages 프로젝트 내부에서 Durable Object를 직접 생성할 수는 없다. Durable Object는 방별 WebSocket 연결을 조정하는 용도로 적합하지만, 지속적인 물리 틱을 운영하기 전에 Worker CPU/비용 모델을 별도로 검토한다.
+
+## Docker는 무엇인가
+
+Docker는 별도의 서버나 API가 아니라, 서버 프로그램과 실행 환경을 하나의 **컨테이너 이미지**로 포장하는 도구다. 이 저장소에서는 `server/index.ts`가 실제 WebSocket 게임 서버이고, `Dockerfile`은 이 서버를 어떤 호스팅 환경에서도 같은 Node 버전·의존성으로 실행하도록 설명한다.
+
+즉 역할은 다음과 같다.
+
+```text
+Dockerfile → WebSocket 서버 실행 이미지를 만듦
+Fly.io / Render / Railway → 그 이미지를 인터넷에서 계속 실행함
+Cloudflare Pages → 브라우저용 정적 파일을 배포함
+```
+
+Docker 이미지는 API 서버뿐 아니라 데이터 처리 작업, 프록시, 게임 서버 등 어떤 프로그램도 실행할 수 있다. Stackmate에서는 REST API가 아니라 장시간 연결을 유지하는 WebSocket 게임 서버를 컨테이너로 실행한다.
+
+## Worker와 Durable Object는 무엇인가
+
+- **Cloudflare Worker**: HTTP/WebSocket 요청이 들어올 때 Cloudflare 엣지에서 실행되는 짧은 서버 코드다. 경로 확인, 인증, 요청을 올바른 방으로 전달하는 관문 역할을 맡는다.
+- **Durable Object (DO)**: 이름으로 하나만 존재하는 상태 보관형 Worker 인스턴스다. 예를 들어 `room-AB12CD`라는 DO 하나에 해당 방의 두 WebSocket 연결과 게임 상태를 모을 수 있다. 따라서 두 브라우저가 같은 방 상태를 보게 만드는 조정자에 적합하다.
+
+```text
+브라우저 1 ─┐
+           ├─ Worker ─ Durable Object "room-AB12CD" ─ 방 상태·WebSocket 연결
+브라우저 2 ─┘
+```
+
+간단한 채팅·턴제 게임이라면 Pages + Worker + Durable Object만으로도 좋은 선택이다. 반면 Stackmate처럼 Rapier 물리를 1초에 여러 번 계속 계산하는 게임 서버는, 시범 단계에서는 Docker 기반 Node 프로세스가 더 직접적이다. 나중에 DO로 옮기려면 물리 틱·CPU 제한·휴면 비용을 별도로 설계해야 한다.
 
 ## 로컬 확인
 
