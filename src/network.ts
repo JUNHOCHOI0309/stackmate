@@ -8,8 +8,10 @@ export type RoomState = {
 };
 
 export type MatchState = {
+  colorChoiceEndsAt: number | null;
+  colorSelectionWinnerId: string | null;
   fen: string | null;
-  phase: 'chess' | 'complete' | 'stacking';
+  phase: 'chess' | 'color_selection' | 'complete' | 'stacking';
   revision: number;
   stacking: {
     isDropping: boolean;
@@ -78,6 +80,10 @@ export class MatchSocket {
     return this.room?.match ?? null;
   }
 
+  getRoom() {
+    return this.room;
+  }
+
   createPrivateRoom() {
     this.send({ type: 'create_room' });
   }
@@ -100,6 +106,10 @@ export class MatchSocket {
 
   submitStackingDrop(revision: number, x: number, angle: number) {
     this.send({ type: 'stacking_drop', angle, revision, x });
+  }
+
+  selectChessColor(color: 'black' | 'white') {
+    this.send({ type: 'select_chess_color', color });
   }
 
   startAuthoritativeChess(fen: string, whitePlayerId: string) {

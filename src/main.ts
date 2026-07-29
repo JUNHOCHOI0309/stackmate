@@ -29,6 +29,7 @@ type StackPiece = {
   outline?: Phaser.GameObjects.Image;
   previousY: number;
   serverId?: string;
+  serverTarget?: { angle: number; x: number; y: number };
   settledOrder: number;
   sprite: Phaser.GameObjects.Image;
   width: number;
@@ -129,6 +130,8 @@ class StackingScene extends Phaser.Scene {
   private lastTimerTickMs = Date.now();
   private mode: GameMode = 'single';
   private networkMatch: MatchState | null = null;
+  private networkChessStarted = false;
+  private networkColorSelectionShown = false;
   private removeMatchListener: (() => void) | null = null;
   private networkText!: Phaser.GameObjects.Text;
   private opponentRating = 1200;
@@ -194,7 +197,7 @@ class StackingScene extends Phaser.Scene {
       return;
     }
     if (this.mode === 'multiplayer') {
-      this.updateNetworkStacking();
+      this.updateNetworkStacking(delta);
       return;
     }
     if (!this.gameEnded && this.activePiece !== null) {
@@ -673,9 +676,12 @@ class StackingScene extends Phaser.Scene {
   }
 
   private applyNetworkPhysics(match: MatchState) {
-    if (match.phase !== 'stacking' || match.stacking === null) {
+    if (match.phase === 'chess') {
+      this.startNetworkChess(match);
+      return;
+    }
+    if (match.stacking === null) {
       this.gameEnded = match.phase === 'complete';
-      if (match.phase === 'complete') this.statusText.setText('서버가 쌓기 결과를 확정했습니다. 체스 전환은 다음 단계에서 연결됩니다.');
       return;
     }
     const snapshot = match.stacking;
@@ -688,11 +694,12 @@ class StackingScene extends Phaser.Scene {
         piece = this.createPiece(serverPiece.kind, serverPiece.color);
         piece.serverId = serverPiece.id;
         this.pieces.push(piece);
+        piece.body.setTranslation({ x: serverPiece.x, y: serverPiece.y }, true);
+        piece.body.setRotation(serverPiece.angle, true);
       }
       piece.settledOrder = serverPiece.settledOrder;
       piece.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
-      piece.body.setTranslation({ x: serverPiece.x, y: serverPiece.y }, true);
-      piece.body.setRotation(serverPiece.angle, true);
+      piece.serverTarget = { angle: serverPiece.angle, x: serverPiece.x, y: serverPiece.y };
     }
 
     if (snapshot.isDropping || snapshot.nextPiece === null) {
@@ -714,8 +721,44 @@ class StackingScene extends Phaser.Scene {
 
     this.turnTimeRemaining = Math.max(0, snapshot.turnEndsAt - Date.now());
     this.playerText.setText(`${PLAYER_LABEL[this.player]}의 차례 · 서버 권위 물리`);
-    this.statusText.setText(this.canControlActivePiece() ? '위치를 정한 뒤 낙하하세요' : '상대 또는 서버 물리 시뮬레이션 진행 중…');
+    if (match.phase === 'color_selection') {
+      this.gameEnded = true;
+      this.showNetworkColorSelection(match);
+    } else {
+      this.statusText.setText(this.canControlActivePiece() ? '위치를 정한 뒤 낙하하세요' : '상대 또는 서버 물리 시뮬레이션 진행 중…');
+    }
     this.syncSprites();
+  }
+
+  private showNetworkColorSelection(match: MatchState) {
+    if (this.networkColorSelectionShown || match.colorChoiceEndsAt === null) return;
+    this.networkColorSelectionShown = true;
+    const isWinner = match.colorSelectionWinnerId === matchSocket.getClientId();
+    this.statusText.setText(isWinner ? '쌓기 승리 · 체스 진영을 선택하세요' : '상대가 체스 진영을 선택하는 중입니다');
+    this.add.text(GAME_WIDTH / 2, GAME_HEIGHT / 2 - 26, isWinner
+      ? '10초 안에 체스에서 플레이할 진영을 선택하세요'
+      : '상대가 체스 진영을 선택 중입니다 · 미선택 시 백으로 시작', {
+      color: '#d5ddff', fontFamily: 'system-ui, sans-serif', fontSize: '20px',
+    }).setDepth(30).setOrigin(0.5).setName('chess-action');
+    if (!isWinner) return;
+    this.createActionButton(GAME_WIDTH / 2 - 148, GAME_HEIGHT / 2 + 44, '백으로 시작 · 5:30', () => matchSocket.selectChessColor('white'), 0x556487);
+    this.createActionButton(GAME_WIDTH / 2 + 148, GAME_HEIGHT / 2 + 44, '흑으로 시작 · 5:30', () => matchSocket.selectChessColor('black'), 0x262b3a);
+  }
+
+  private startNetworkChess(match: MatchState) {
+    if (this.networkChessStarted || match.fen === null) return;
+    const room = matchSocket.getRoom();
+    const stackWinner = room?.players.find((player) => player.id === match.winnerPlayerId)?.slot ?? 'white';
+    const winnerColor: PlayerColor = match.whitePlayerId === match.winnerPlayerId ? 'white' : 'black';
+    this.networkChessStarted = true;
+    this.scene.start('chess', {
+      fen: match.fen,
+      mode: 'multiplayer',
+      opponentRating: this.opponentRating,
+      stackWinner,
+      survivors: this.collectSurvivors(),
+      winnerColor,
+    });
   }
 
   private removePiece(piece: StackPiece) {
@@ -789,16 +832,36 @@ class StackingScene extends Phaser.Scene {
     activePiece.body.setNextKinematicRotation(this.activeAngle);
   }
 
-  private updateNetworkStacking() {
+  private updateNetworkStacking(delta: number) {
     const match = this.networkMatch;
-    if (match?.phase !== 'stacking' || match.stacking === null) return;
-    if (this.activePiece !== null && this.canControlActivePiece()) this.updateActivePiece(16);
+    if (match === null || match === undefined || match.stacking === null) return;
+    const blend = 1 - Math.exp((-delta * 14) / 1000);
+    this.pieces.forEach((piece) => {
+      if (piece.serverTarget === undefined) return;
+      const current = piece.body.translation();
+      const rotation = piece.body.rotation();
+      piece.body.setTranslation({
+        x: Phaser.Math.Linear(current.x, piece.serverTarget.x, blend),
+        y: Phaser.Math.Linear(current.y, piece.serverTarget.y, blend),
+      }, true);
+      piece.body.setRotation(rotation + Phaser.Math.Angle.Wrap(piece.serverTarget.angle - rotation) * blend, true);
+    });
+    this.syncSprites();
+
+    if (match.phase === 'color_selection' && match.colorChoiceEndsAt !== null) {
+      const remaining = Math.max(0, match.colorChoiceEndsAt - Date.now());
+      this.timerText.setText(`진영 선택 ${(remaining / 1000).toFixed(1)}`).setColor('#ffdf8a');
+      return;
+    }
+    if (match.phase !== 'stacking') return;
+    if (this.activePiece !== null && this.canControlActivePiece()) this.updateActivePiece(delta);
     const remaining = Math.max(0, match.stacking.turnEndsAt - Date.now());
     this.timerText.setText((remaining / 1000).toFixed(1)).setColor(remaining <= 3_000 ? '#ff8d8d' : '#f5f2e8');
   }
 }
 
 type ChessStartData = {
+  fen?: string;
   mode: GameMode;
   opponentRating: number;
   stackWinner: PlayerColor | null;
@@ -868,7 +931,7 @@ class ChessScene extends Phaser.Scene {
       white: data.survivors.filter((piece) => piece.color === 'white').length,
       black: data.survivors.filter((piece) => piece.color === 'black').length,
     };
-    this.chess = this.createChessFromSurvivors(data.survivors);
+    this.chess = data.fen === undefined ? this.createChessFromSurvivors(data.survivors) : new Chess(data.fen);
     this.capturedBy = { w: [], b: [] };
     this.drawOfferBy = null;
     this.gameOver = false;

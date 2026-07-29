@@ -2,6 +2,7 @@ import RAPIER, { type RigidBody, type World } from '@dimforge/rapier2d-compat';
 
 export type PieceKind = 'pawn' | 'rook' | 'knight' | 'bishop' | 'queen';
 export type PlayerColor = 'white' | 'black';
+export type SurvivorPiece = { color: PlayerColor; kind: PieceKind; settledOrder: number };
 
 type PieceSpec = { height: number; width: number };
 type PhysicsPiece = {
@@ -77,6 +78,12 @@ export class StackingSimulation {
 
   getTurn() {
     return this.turn;
+  }
+
+  getSurvivors(): SurvivorPiece[] {
+    return [...this.pieces.values()]
+      .filter((piece) => piece.body.translation().y <= FALL_LINE_Y)
+      .map((piece) => ({ color: piece.color, kind: piece.kind, settledOrder: piece.settledOrder }));
   }
 
   snapshot(): StackingSnapshot {

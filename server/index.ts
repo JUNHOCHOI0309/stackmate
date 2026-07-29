@@ -2,7 +2,7 @@ import { Chess } from 'chess.js';
 import RAPIER from '@dimforge/rapier2d-compat';
 import { createServer } from 'node:http';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
-import { StackingSimulation, type PlayerColor } from './stacking';
+import { StackingSimulation, type PieceKind, type PlayerColor, type SurvivorPiece } from './stacking';
 
 type Client = {
   id: string;
@@ -14,7 +14,10 @@ type Client = {
 type ServerMatchState = {
   chess: Chess | null;
   fen: string | null;
-  phase: 'chess' | 'complete' | 'stacking';
+  colorChoiceEndsAt: number | null;
+  colorSelectionWinnerId: string | null;
+  lastSnapshotAt: number;
+  phase: 'chess' | 'color_selection' | 'complete' | 'stacking';
   revision: number;
   stacking: StackingSimulation | null;
   stackingTurnPlayerId: string | null;
@@ -35,6 +38,7 @@ type ClientMessage =
   | { type: 'join_matchmaking'; rating: number }
   | { type: 'leave_room' }
   | { type: 'stacking_drop'; angle: number; revision: number; x: number }
+  | { type: 'select_chess_color'; color: PlayerColor }
   | { type: 'start_chess'; fen: string; whitePlayerId: string }
   | { type: 'chess_move'; from: string; promotion?: 'b' | 'n' | 'q' | 'r'; revision: number; to: string }
   | { type: 'game_action'; action: unknown };
@@ -68,6 +72,8 @@ function serializeMatchState(match: ServerMatchState | null) {
   if (match === null) return null;
   return {
     fen: match.fen,
+    colorChoiceEndsAt: match.colorChoiceEndsAt,
+    colorSelectionWinnerId: match.colorSelectionWinnerId,
     phase: match.phase,
     revision: match.revision,
     stacking: match.stacking?.snapshot() ?? null,
@@ -96,6 +102,9 @@ function broadcastRoom(room: Room) {
 function createMatchState(room: Room): ServerMatchState {
   return {
     chess: null,
+    colorChoiceEndsAt: null,
+    colorSelectionWinnerId: null,
+    lastSnapshotAt: 0,
     fen: null,
     phase: 'stacking',
     revision: 0,
@@ -207,6 +216,77 @@ function handleStartChess(client: Client, fen: string, whitePlayerId: string) {
   broadcastRoom(room);
 }
 
+function chessPieceType(kind: PieceKind) {
+  return ({ bishop: 'b', knight: 'n', pawn: 'p', queen: 'q', rook: 'r' } as const)[kind];
+}
+
+function buildChessFen(survivors: SurvivorPiece[], whiteStackColor: PlayerColor) {
+  const board = new Map<string, { color: 'b' | 'w'; type: string }>();
+  board.set('e1', { color: 'w', type: 'k' });
+  board.set('e8', { color: 'b', type: 'k' });
+  const pawnFiles = ['d', 'e', 'c', 'f', 'b', 'g', 'a', 'h'];
+  const whiteBackRankFiles = ['a', 'b', 'c', 'd', 'f', 'g', 'h'];
+  const blackBackRankFiles = ['h', 'g', 'f', 'd', 'c', 'b', 'a'];
+  (['w', 'b'] as const).forEach((color) => {
+    const stackColor: PlayerColor = color === 'w' ? whiteStackColor : (whiteStackColor === 'white' ? 'black' : 'white');
+    const playerSurvivors = survivors.filter((piece) => piece.color === stackColor);
+    const pawnRank = color === 'w' ? '2' : '7';
+    const backRank = color === 'w' ? '1' : '8';
+    const backRankFiles = color === 'w' ? whiteBackRankFiles : blackBackRankFiles;
+    playerSurvivors.filter((piece) => piece.kind === 'pawn').slice(0, pawnFiles.length).forEach((_, index) => {
+      board.set(`${pawnFiles[index]}${pawnRank}`, { color, type: 'p' });
+    });
+    playerSurvivors.filter((piece) => piece.kind !== 'pawn').sort((a, b) => a.settledOrder - b.settledOrder).slice(0, backRankFiles.length).forEach((piece, index) => {
+      board.set(`${backRankFiles[index]}${backRank}`, { color, type: chessPieceType(piece.kind) });
+    });
+  });
+  const rankFen = (rank: number) => {
+    let empty = 0;
+    let value = '';
+    for (const file of ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']) {
+      const piece = board.get(`${file}${rank}`);
+      if (piece === undefined) { empty += 1; continue; }
+      if (empty > 0) { value += empty; empty = 0; }
+      value += piece.color === 'w' ? piece.type.toUpperCase() : piece.type;
+    }
+    return `${value}${empty || ''}`;
+  };
+  const hasRook = (square: string, color: 'b' | 'w') => board.get(square)?.color === color && board.get(square)?.type === 'r';
+  const castling = `${hasRook('h1', 'w') ? 'K' : ''}${hasRook('a1', 'w') ? 'Q' : ''}${hasRook('h8', 'b') ? 'k' : ''}${hasRook('a8', 'b') ? 'q' : ''}` || '-';
+  return `${[8, 7, 6, 5, 4, 3, 2, 1].map(rankFen).join('/')} w ${castling} - 0 1`;
+}
+
+function startChessFromStack(room: Room, match: ServerMatchState, winnerColor: PlayerColor) {
+  const winnerId = match.colorSelectionWinnerId;
+  if (winnerId === null || match.stacking === null) return;
+  const whitePlayerId = winnerColor === 'white'
+    ? winnerId
+    : room.players.find((player) => player.id !== winnerId)?.id ?? null;
+  if (whitePlayerId === null) return;
+  const whiteStackColor: PlayerColor = room.players[0]?.id === whitePlayerId ? 'white' : 'black';
+  const chess = new Chess(buildChessFen(match.stacking.getSurvivors(), whiteStackColor));
+  match.chess = chess;
+  match.fen = chess.fen();
+  match.phase = 'chess';
+  match.whitePlayerId = whitePlayerId;
+  match.colorChoiceEndsAt = null;
+  match.colorSelectionWinnerId = null;
+  match.stackingTurnPlayerId = null;
+  match.stacking.destroy();
+  match.stacking = null;
+  match.revision += 1;
+  broadcastRoom(room);
+}
+
+function handleChessColorSelection(client: Client, color: PlayerColor) {
+  const room = getRoomForClient(client);
+  const match = room?.match;
+  if (room === undefined || match === undefined || match === null || match.phase !== 'color_selection' || match.colorSelectionWinnerId !== client.id) {
+    return rejectAction(client, '체스 진영을 선택할 수 있는 상태가 아닙니다.');
+  }
+  startChessFromStack(room, match, color);
+}
+
 function handleChessMove(client: Client, message: Extract<ClientMessage, { type: 'chess_move' }>) {
   const room = getRoomForClient(client);
   const match = room?.match;
@@ -275,6 +355,7 @@ wss.on('connection', (socket) => {
     }
     if (message.type === 'leave_room') return leaveRoom(client);
     if (message.type === 'stacking_drop') return handleStackingDrop(client, message.revision, message.x, message.angle);
+    if (message.type === 'select_chess_color') return handleChessColorSelection(client, message.color);
     if (message.type === 'start_chess') return handleStartChess(client, message.fen, message.whitePlayerId);
     if (message.type === 'chess_move') return handleChessMove(client, message);
     if (message.type === 'game_action') {
@@ -298,11 +379,18 @@ setInterval(() => {
   const now = Date.now();
   rooms.forEach((room) => {
     const match = room.match;
+    if (match?.phase === 'color_selection' && match.colorChoiceEndsAt !== null && now >= match.colorChoiceEndsAt) {
+      startChessFromStack(room, match, 'white');
+      return;
+    }
     if (match?.phase !== 'stacking' || match.stacking === null) return;
     const result = match.stacking.tick(now);
     if (result.outcome !== null) {
-      match.phase = 'complete';
-      match.winnerPlayerId = playerForStackColor(room, result.outcome === 'white' ? 'black' : 'white')?.id ?? null;
+      const winnerId = playerForStackColor(room, result.outcome === 'white' ? 'black' : 'white')?.id ?? null;
+      match.phase = 'color_selection';
+      match.winnerPlayerId = winnerId;
+      match.colorSelectionWinnerId = winnerId;
+      match.colorChoiceEndsAt = now + 10_000;
       match.stackingTurnPlayerId = null;
       match.revision += 1;
       broadcastRoom(room);
@@ -315,6 +403,9 @@ setInterval(() => {
       broadcastRoom(room);
       return;
     }
-    if (now % 100 < 17) broadcastRoom(room);
+    if (now - match.lastSnapshotAt >= 33) {
+      match.lastSnapshotAt = now;
+      broadcastRoom(room);
+    }
   });
 }, 1000 / 60);
