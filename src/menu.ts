@@ -12,6 +12,7 @@ type MatchStartData = {
 
 export class MenuScene extends Phaser.Scene {
   private inviteButton: Phaser.GameObjects.Container | null = null;
+  private inviteToken: string | null = null;
   private roomText!: Phaser.GameObjects.Text;
   private startingGame = false;
   private statusText!: Phaser.GameObjects.Text;
@@ -55,9 +56,9 @@ export class MenuScene extends Phaser.Scene {
       removeRoomListener();
     });
     matchSocket.connect();
-    const invitedRoom = new URLSearchParams(location.search).get('room');
-    if (invitedRoom !== null) {
-      matchSocket.joinPrivateRoom(invitedRoom);
+    const inviteToken = new URLSearchParams(location.search).get('invite');
+    if (inviteToken !== null) {
+      matchSocket.joinPrivateInvite(inviteToken);
     }
   }
 
@@ -73,10 +74,12 @@ export class MenuScene extends Phaser.Scene {
   }
 
   private handleRoom(room: RoomState) {
-    const type = room.mode === 'match' ? '빠른 매칭' : '비공개 방';
-    this.roomText.setText(`${type} 코드: ${room.roomId}${room.ready ? ' · 매치 시작' : ' · 상대를 기다리는 중'}`);
-    if (room.mode === 'private' && this.inviteButton === null) {
-      this.inviteButton = this.createInviteButton(room.roomId);
+    if (room.mode === 'match') {
+      this.roomText.setText(room.ready ? '빠른 매칭 완료 · 매치 시작' : '빠른 매칭에서 상대를 기다리는 중');
+      this.setInviteButton(null);
+    } else {
+      this.roomText.setText(`비공개 방 코드: ${room.roomId}${room.ready ? ' · 매치 시작' : ' · 상대를 기다리는 중'}`);
+      this.setInviteButton(room.inviteToken ?? null);
     }
     if (room.ready && !this.startingGame) {
       this.startingGame = true;
@@ -91,7 +94,7 @@ export class MenuScene extends Phaser.Scene {
     }
   }
 
-  private createInviteButton(roomId: string) {
+  private createInviteButton(inviteToken: string) {
     const button = this.add.container(GAME_WIDTH / 2, 678);
     const background = this.add.rectangle(0, 0, 300, 46, 0x34436d, 1)
       .setStrokeStyle(2, 0xcbd6ff)
@@ -101,7 +104,8 @@ export class MenuScene extends Phaser.Scene {
     }).setOrigin(0.5);
     background.on('pointerdown', async () => {
       const inviteUrl = new URL(location.href);
-      inviteUrl.searchParams.set('room', roomId);
+      inviteUrl.searchParams.delete('room');
+      inviteUrl.searchParams.set('invite', inviteToken);
       try {
         await navigator.clipboard.writeText(inviteUrl.toString());
         this.statusText.setText('초대 링크를 복사했습니다. 친구에게 보내세요.');
@@ -113,6 +117,14 @@ export class MenuScene extends Phaser.Scene {
     background.on('pointerout', () => background.setFillStyle(0x34436d));
     button.add([background, text]);
     return button;
+  }
+
+  private setInviteButton(inviteToken: string | null) {
+    if (this.inviteToken === inviteToken) return;
+    this.inviteButton?.destroy(true);
+    this.inviteButton = null;
+    this.inviteToken = inviteToken;
+    if (inviteToken !== null) this.inviteButton = this.createInviteButton(inviteToken);
   }
 
   private startGame(data: MatchStartData) {

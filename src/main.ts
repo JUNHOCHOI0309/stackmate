@@ -1337,7 +1337,10 @@ class ChessScene extends Phaser.Scene {
     const label = this.add.text(0, 95, '메인으로 돌아가기', {
       color: '#f5f7ff', fontFamily: 'system-ui, sans-serif', fontSize: '18px', fontStyle: '700',
     }).setOrigin(0.5);
-    button.on('pointerdown', () => this.scene.start('menu'));
+    button.on('pointerdown', () => {
+      if (this.mode === 'multiplayer') matchSocket.leaveRoom();
+      this.scene.start('menu');
+    });
     panel.add([button, label]);
   }
 

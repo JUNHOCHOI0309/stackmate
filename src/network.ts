@@ -3,6 +3,7 @@ export type RoomState = {
   mode: 'match' | 'private';
   players: Array<{ connected: boolean; id: string; slot: 'white' | 'black' }>;
   opponentRating?: number;
+  inviteToken?: string | null;
   ready: boolean;
   roomId: string;
 };
@@ -28,6 +29,7 @@ export type MatchState = {
 type ServerMessage =
   | { type: 'connected'; clientId: string }
   | ({ type: 'room_state' } & RoomState)
+  | { type: 'room_closed'; message: string }
   | { type: 'matchmaking_wait'; rating: number }
   | { type: 'error'; message: string }
   | { type: 'game_action'; from: string; action: unknown };
@@ -53,15 +55,19 @@ export class MatchSocket {
   private statusListeners = new Set<(status: string) => void>();
 
   connect() {
-    if (this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING) {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.publishStatus('연결됨');
+      return;
+    }
+    if (this.socket?.readyState === WebSocket.CONNECTING) {
       return;
     }
     const configuredEndpoint = import.meta.env.VITE_WS_URL?.trim();
     const endpoint = new URL(configuredEndpoint || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hostname}:8787`);
-    endpoint.searchParams.set('session', this.sessionId);
     this.publishStatus('연결 중…');
     this.socket = new WebSocket(endpoint);
     this.socket.addEventListener('open', () => {
+      this.socket?.send(JSON.stringify({ type: 'identify_session', sessionId: this.sessionId }));
       this.publishStatus('연결됨');
       this.pendingMessages.splice(0).forEach((message) => this.send(message));
     });
@@ -105,9 +111,24 @@ export class MatchSocket {
     this.send({ type: 'join_room', roomId: roomId.trim().toUpperCase() });
   }
 
+  joinPrivateInvite(token: string) {
+    this.send({ type: 'join_invite', token });
+  }
+
   joinMatchmaking(rating: number) {
     this.send({ type: 'join_matchmaking', rating });
     this.publishStatus(`레이팅 ${rating} 기준 상대 탐색 중…`);
+  }
+
+  leaveRoom() {
+    if (this.room === null) return;
+    this.send({ type: 'leave_room' });
+    this.room = null;
+    const url = new URL(location.href);
+    url.searchParams.delete('room');
+    url.searchParams.delete('invite');
+    history.replaceState(null, '', url);
+    this.publishStatus('연결됨');
   }
 
   sendGameAction(action: unknown) {
@@ -145,12 +166,25 @@ export class MatchSocket {
     if (message.type === 'room_state') {
       this.room = message;
       const url = new URL(location.href);
-      url.searchParams.set('room', message.roomId);
+      url.searchParams.delete('room');
+      if (message.mode === 'private' && message.inviteToken !== undefined && message.inviteToken !== null) {
+        url.searchParams.set('invite', message.inviteToken);
+      }
+      if (message.mode === 'match') url.searchParams.delete('invite');
       history.replaceState(null, '', url);
       this.publishStatus(message.ready ? `방 ${message.roomId} · 2명 연결됨` : `방 ${message.roomId} · 상대 대기 중`);
       this.roomListeners.forEach((listener) => listener(message));
       const match = message.match;
       if (match !== null) this.matchListeners.forEach((listener) => listener(match));
+      return;
+    }
+    if (message.type === 'room_closed') {
+      this.room = null;
+      const url = new URL(location.href);
+      url.searchParams.delete('room');
+      url.searchParams.delete('invite');
+      history.replaceState(null, '', url);
+      this.publishStatus(message.message);
       return;
     }
     if (message.type === 'matchmaking_wait') {

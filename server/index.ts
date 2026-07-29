@@ -1,5 +1,6 @@
 import { Chess } from 'chess.js';
 import RAPIER from '@dimforge/rapier2d-compat';
+import { randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { StackingSimulation, type PieceKind, type PlayerColor, type SurvivorPiece } from './stacking';
@@ -7,6 +8,8 @@ import { StackingSimulation, type PieceKind, type PlayerColor, type SurvivorPiec
 type Client = {
   disconnectedAt: number | null;
   id: string;
+  identified: boolean;
+  joinAttemptKey: string;
   rating: number | null;
   roomId: string | null;
   socket: WebSocket;
@@ -28,13 +31,18 @@ type ServerMatchState = {
 
 type Room = {
   id: string;
+  hostId: string | null;
+  inviteExpiresAt: number | null;
+  inviteToken: string | null;
   match: ServerMatchState | null;
   mode: 'match' | 'private';
   players: Client[];
 };
 
 type ClientMessage =
+  | { type: 'identify_session'; sessionId: string }
   | { type: 'create_room' }
+  | { type: 'join_invite'; token: string }
   | { type: 'join_room'; roomId: string }
   | { type: 'join_matchmaking'; rating: number }
   | { type: 'leave_room' }
@@ -45,7 +53,7 @@ type ClientMessage =
   | { type: 'chess_forfeit'; reason: 'resign' | 'timeout' }
   | { type: 'game_action'; action: unknown };
 
-const port = Number(process.env.WS_PORT ?? 8787);
+const port = Number(process.env.PORT ?? process.env.WS_PORT ?? 8787);
 const httpServer = createServer((request, response) => {
   if (request.url === '/health') {
     response.writeHead(200, { 'content-type': 'application/json' });
@@ -60,11 +68,68 @@ const clients = new Map<WebSocket, Client>();
 const matchmakingQueue = new Set<Client>();
 const rooms = new Map<string, Room>();
 const RECONNECT_GRACE_MS = 5 * 60_000;
+const INVITE_TTL_MS = 30 * 60_000;
+const JOIN_ATTEMPT_LIMIT = 10;
+const JOIN_ATTEMPT_WINDOW_MS = 60_000;
+const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const joinAttempts = new Map<string, number[]>();
+let lastJoinAttemptCleanupAt = 0;
 
 await RAPIER.init();
 
-function createId(length = 6) {
-  return Math.random().toString(36).slice(2, 2 + length).toUpperCase();
+function createOpaqueToken(bytes = 16) {
+  return randomBytes(bytes).toString('base64url');
+}
+
+function createRoomCode(length = 6) {
+  return [...randomBytes(length)].map((byte) => ROOM_CODE_ALPHABET[byte % ROOM_CODE_ALPHABET.length]).join('');
+}
+
+function createAvailableRoomCode() {
+  let roomId = createRoomCode();
+  while (rooms.has(roomId)) roomId = createRoomCode();
+  return roomId;
+}
+
+function createPrivateRoom(host: Client): Room {
+  return {
+    hostId: host.id,
+    id: createAvailableRoomCode(),
+    inviteExpiresAt: Date.now() + INVITE_TTL_MS,
+    inviteToken: createOpaqueToken(32),
+    match: null,
+    mode: 'private',
+    players: [],
+  };
+}
+
+function invalidateInvite(room: Room) {
+  room.inviteExpiresAt = null;
+  room.inviteToken = null;
+}
+
+function rotateInvite(room: Room) {
+  room.inviteExpiresAt = Date.now() + INVITE_TTL_MS;
+  room.inviteToken = createOpaqueToken(32);
+}
+
+function isSessionId(value: string) {
+  return /^[A-Za-z0-9_-]{16,128}$/.test(value);
+}
+
+function requestAttemptKey(request: import('node:http').IncomingMessage) {
+  const forwarded = request.headers['x-forwarded-for'];
+  const forwardedAddress = typeof forwarded === 'string' ? forwarded.split(',')[0]?.trim() : undefined;
+  return forwardedAddress || request.socket.remoteAddress || createOpaqueToken();
+}
+
+function allowRoomJoinAttempt(client: Client) {
+  const now = Date.now();
+  const recentAttempts = (joinAttempts.get(client.joinAttemptKey) ?? []).filter((timestamp) => now - timestamp < JOIN_ATTEMPT_WINDOW_MS);
+  if (recentAttempts.length >= JOIN_ATTEMPT_LIMIT) return false;
+  recentAttempts.push(now);
+  joinAttempts.set(client.joinAttemptKey, recentAttempts);
+  return true;
 }
 
 function send(socket: WebSocket, message: unknown) {
@@ -93,6 +158,7 @@ function roomSnapshot(room: Room, recipient: Client) {
     match: serializeMatchState(room.match),
     mode: room.mode,
     opponentRating: opponent?.rating,
+    inviteToken: room.mode === 'private' && recipient.id === room.hostId ? room.inviteToken : undefined,
     players: room.players.map((player, index) => ({ connected: player.disconnectedAt === null, id: player.id, slot: index === 0 ? 'white' : 'black' })),
     ready: room.players.length === 2,
     roomId: room.id,
@@ -133,6 +199,15 @@ function leaveRoom(client: Client) {
   const room = rooms.get(client.roomId);
   client.roomId = null;
   if (room === undefined) return;
+  if (room.mode === 'private' && room.hostId === client.id) {
+    room.match?.stacking?.destroy();
+    rooms.delete(room.id);
+    room.players.filter((player) => player.id !== client.id).forEach((player) => {
+      player.roomId = null;
+      send(player.socket, { type: 'room_closed', message: '방장이 방을 나가 방이 종료되었습니다.' });
+    });
+    return;
+  }
   room.players = room.players.filter((player) => player.id !== client.id);
   if (room.players.length === 0) {
     room.match?.stacking?.destroy();
@@ -141,6 +216,7 @@ function leaveRoom(client: Client) {
   }
   room.match?.stacking?.destroy();
   room.match = null;
+  if (room.mode === 'private') rotateInvite(room);
   broadcastRoom(room);
 }
 
@@ -161,7 +237,10 @@ function joinRoom(client: Client, room: Room) {
   leaveRoom(client);
   client.roomId = room.id;
   room.players.push(client);
-  if (room.players.length === 2 && room.match === null) room.match = createMatchState(room);
+  if (room.players.length === 2 && room.match === null) {
+    invalidateInvite(room);
+    room.match = createMatchState(room);
+  }
   broadcastRoom(room);
 }
 
@@ -172,9 +251,31 @@ function disconnectClient(client: Client) {
   if (room !== undefined) broadcastRoom(room);
 }
 
-function clientIdFromRequest(url: string | undefined) {
-  const sessionId = new URL(url ?? '/', 'ws://stackmate.local').searchParams.get('session');
-  return sessionId !== null && /^[A-Za-z0-9_-]{8,128}$/.test(sessionId) ? sessionId : createId(10);
+function restoreRoomForSession(client: Client) {
+  const room = [...rooms.values()].find((candidate) => candidate.players.some((player) => player.id === client.id));
+  if (room !== undefined) joinRoom(client, room);
+}
+
+function identifySession(client: Client, sessionId: string) {
+  if (!isSessionId(sessionId)) return rejectAction(client, '유효하지 않은 세션입니다.');
+  if (client.identified) return;
+  client.id = sessionId;
+  client.identified = true;
+  send(client.socket, { type: 'connected', clientId: client.id });
+  restoreRoomForSession(client);
+}
+
+function joinPrivateInvite(client: Client, token: string) {
+  if (!allowRoomJoinAttempt(client)) return rejectAction(client, '방 참가 요청이 너무 많습니다. 잠시 후 다시 시도하세요.');
+  const room = [...rooms.values()].find((candidate) => candidate.mode === 'private' && candidate.inviteToken === token);
+  if (room === undefined || room.inviteExpiresAt === null || room.inviteExpiresAt <= Date.now()) {
+    if (room !== undefined) {
+      invalidateInvite(room);
+      broadcastRoom(room);
+    }
+    return rejectAction(client, '유효하지 않거나 만료된 초대 링크입니다.');
+  }
+  joinRoom(client, room);
 }
 
 function joinMatchmaking(client: Client, rating: number) {
@@ -189,7 +290,7 @@ function joinMatchmaking(client: Client, rating: number) {
     return;
   }
   matchmakingQueue.delete(opponent);
-  const room: Room = { id: createId(), match: null, mode: 'match', players: [] };
+  const room: Room = { hostId: null, id: createAvailableRoomCode(), inviteExpiresAt: null, inviteToken: null, match: null, mode: 'match', players: [] };
   rooms.set(room.id, room);
   joinRoom(opponent, room);
   joinRoom(client, room);
@@ -382,22 +483,35 @@ function parseMessage(data: RawData) {
 }
 
 wss.on('connection', (socket, request) => {
-  const client: Client = { disconnectedAt: null, id: clientIdFromRequest(request.url), rating: null, roomId: null, socket };
+  const client: Client = {
+    disconnectedAt: null,
+    id: createOpaqueToken(),
+    identified: false,
+    joinAttemptKey: requestAttemptKey(request),
+    rating: null,
+    roomId: null,
+    socket,
+  };
   clients.set(socket, client);
-  send(socket, { type: 'connected', clientId: client.id });
 
   socket.on('message', (data) => {
     const message = parseMessage(data);
     if (message === null) return rejectAction(client, '잘못된 메시지 형식입니다.');
+    if (message.type === 'identify_session') return identifySession(client, message.sessionId);
+    if (!client.identified) return rejectAction(client, '세션 초기화 중입니다. 잠시 후 다시 시도하세요.');
     if (message.type === 'create_room') {
-      const room: Room = { id: createId(), match: null, mode: 'private', players: [] };
+      const room = createPrivateRoom(client);
       rooms.set(room.id, room);
       return joinRoom(client, room);
     }
     if (message.type === 'join_matchmaking') return joinMatchmaking(client, message.rating);
+    if (message.type === 'join_invite') return joinPrivateInvite(client, message.token);
     if (message.type === 'join_room') {
+      if (!allowRoomJoinAttempt(client)) return rejectAction(client, '방 참가 요청이 너무 많습니다. 잠시 후 다시 시도하세요.');
       const room = rooms.get(message.roomId.toUpperCase());
-      return room === undefined ? rejectAction(client, '방을 찾을 수 없습니다.') : joinRoom(client, room);
+      return room === undefined || room.mode !== 'private'
+        ? rejectAction(client, '유효하지 않은 방 코드입니다.')
+        : joinRoom(client, room);
     }
     if (message.type === 'leave_room') return leaveRoom(client);
     if (message.type === 'stacking_drop') return handleStackingDrop(client, message.revision, message.x, message.angle);
@@ -424,7 +538,19 @@ httpServer.listen(port, () => {
 
 setInterval(() => {
   const now = Date.now();
+  if (now - lastJoinAttemptCleanupAt >= JOIN_ATTEMPT_WINDOW_MS) {
+    joinAttempts.forEach((attempts, key) => {
+      const recentAttempts = attempts.filter((timestamp) => now - timestamp < JOIN_ATTEMPT_WINDOW_MS);
+      if (recentAttempts.length === 0) joinAttempts.delete(key);
+      else joinAttempts.set(key, recentAttempts);
+    });
+    lastJoinAttemptCleanupAt = now;
+  }
   rooms.forEach((room) => {
+    if (room.mode === 'private' && room.inviteExpiresAt !== null && now >= room.inviteExpiresAt) {
+      invalidateInvite(room);
+      broadcastRoom(room);
+    }
     const expiredPlayerIds = room.players
       .filter((player) => player.disconnectedAt !== null && now - player.disconnectedAt >= RECONNECT_GRACE_MS)
       .map((player) => player.id);
