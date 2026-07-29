@@ -13,6 +13,7 @@ type MatchStartData = {
 export class MenuScene extends Phaser.Scene {
   private inviteButton: Phaser.GameObjects.Container | null = null;
   private roomText!: Phaser.GameObjects.Text;
+  private startingGame = false;
   private statusText!: Phaser.GameObjects.Text;
 
   constructor() {
@@ -77,7 +78,8 @@ export class MenuScene extends Phaser.Scene {
     if (room.mode === 'private' && this.inviteButton === null) {
       this.inviteButton = this.createInviteButton(room.roomId);
     }
-    if (room.ready) {
+    if (room.ready && !this.startingGame) {
+      this.startingGame = true;
       this.time.delayedCall(650, () => this.startGame({ mode: 'multiplayer', opponentRating: room.opponentRating }));
     }
   }

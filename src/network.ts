@@ -1,7 +1,7 @@
 export type RoomState = {
   match: MatchState | null;
   mode: 'match' | 'private';
-  players: Array<{ id: string; slot: 'white' | 'black' }>;
+  players: Array<{ connected: boolean; id: string; slot: 'white' | 'black' }>;
   opponentRating?: number;
   ready: boolean;
   roomId: string;
@@ -31,12 +31,23 @@ type ServerMessage =
   | { type: 'error'; message: string }
   | { type: 'game_action'; from: string; action: unknown };
 
+const SESSION_STORAGE_KEY = 'stackmate-session-id';
+
+function getPersistentSessionId() {
+  const existing = window.localStorage.getItem(SESSION_STORAGE_KEY);
+  if (existing !== null) return existing;
+  const sessionId = globalThis.crypto.randomUUID().replaceAll('-', '');
+  window.localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+  return sessionId;
+}
+
 export class MatchSocket {
   private clientId: string | null = null;
   private matchListeners = new Set<(match: MatchState) => void>();
   private pendingMessages: unknown[] = [];
   private room: RoomState | null = null;
   private roomListeners = new Set<(room: RoomState) => void>();
+  private readonly sessionId = getPersistentSessionId();
   private socket: WebSocket | null = null;
   private statusListeners = new Set<(status: string) => void>();
 
@@ -45,7 +56,8 @@ export class MatchSocket {
       return;
     }
     const configuredEndpoint = import.meta.env.VITE_WS_URL?.trim();
-    const endpoint = configuredEndpoint || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hostname}:8787`;
+    const endpoint = new URL(configuredEndpoint || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hostname}:8787`);
+    endpoint.searchParams.set('session', this.sessionId);
     this.publishStatus('연결 중…');
     this.socket = new WebSocket(endpoint);
     this.socket.addEventListener('open', () => {

@@ -5,6 +5,7 @@ import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { StackingSimulation, type PieceKind, type PlayerColor, type SurvivorPiece } from './stacking';
 
 type Client = {
+  disconnectedAt: number | null;
   id: string;
   rating: number | null;
   roomId: string | null;
@@ -57,6 +58,7 @@ const wss = new WebSocketServer({ server: httpServer });
 const clients = new Map<WebSocket, Client>();
 const matchmakingQueue = new Set<Client>();
 const rooms = new Map<string, Room>();
+const RECONNECT_GRACE_MS = 5 * 60_000;
 
 await RAPIER.init();
 
@@ -89,7 +91,7 @@ function roomSnapshot(room: Room, recipient: Client) {
     match: serializeMatchState(room.match),
     mode: room.mode,
     opponentRating: opponent?.rating,
-    players: room.players.map((player, index) => ({ id: player.id, slot: index === 0 ? 'white' : 'black' })),
+    players: room.players.map((player, index) => ({ connected: player.disconnectedAt === null, id: player.id, slot: index === 0 ? 'white' : 'black' })),
     ready: room.players.length === 2,
     roomId: room.id,
   };
@@ -135,11 +137,21 @@ function leaveRoom(client: Client) {
     rooms.delete(room.id);
     return;
   }
+  room.match?.stacking?.destroy();
   room.match = null;
   broadcastRoom(room);
 }
 
 function joinRoom(client: Client, room: Room) {
+  const existingSeat = room.players.findIndex((player) => player.id === client.id);
+  if (existingSeat >= 0) {
+    const previousClient = room.players[existingSeat];
+    client.rating ??= previousClient.rating;
+    client.roomId = room.id;
+    room.players[existingSeat] = client;
+    broadcastRoom(room);
+    return;
+  }
   if (room.players.length >= 2) {
     rejectAction(client, '방이 가득 찼습니다.');
     return;
@@ -147,8 +159,20 @@ function joinRoom(client: Client, room: Room) {
   leaveRoom(client);
   client.roomId = room.id;
   room.players.push(client);
-  if (room.players.length === 2) room.match = createMatchState(room);
+  if (room.players.length === 2 && room.match === null) room.match = createMatchState(room);
   broadcastRoom(room);
+}
+
+function disconnectClient(client: Client) {
+  matchmakingQueue.delete(client);
+  client.disconnectedAt = Date.now();
+  const room = getRoomForClient(client);
+  if (room !== undefined) broadcastRoom(room);
+}
+
+function clientIdFromRequest(url: string | undefined) {
+  const sessionId = new URL(url ?? '/', 'ws://stackmate.local').searchParams.get('session');
+  return sessionId !== null && /^[A-Za-z0-9_-]{8,128}$/.test(sessionId) ? sessionId : createId(10);
 }
 
 function joinMatchmaking(client: Client, rating: number) {
@@ -335,8 +359,8 @@ function parseMessage(data: RawData) {
   }
 }
 
-wss.on('connection', (socket) => {
-  const client: Client = { id: createId(10), rating: null, roomId: null, socket };
+wss.on('connection', (socket, request) => {
+  const client: Client = { disconnectedAt: null, id: clientIdFromRequest(request.url), rating: null, roomId: null, socket };
   clients.set(socket, client);
   send(socket, { type: 'connected', clientId: client.id });
 
@@ -366,7 +390,7 @@ wss.on('connection', (socket) => {
   });
 
   socket.on('close', () => {
-    leaveRoom(client);
+    disconnectClient(client);
     clients.delete(socket);
   });
 });
@@ -378,6 +402,20 @@ httpServer.listen(port, () => {
 setInterval(() => {
   const now = Date.now();
   rooms.forEach((room) => {
+    const expiredPlayerIds = room.players
+      .filter((player) => player.disconnectedAt !== null && now - player.disconnectedAt >= RECONNECT_GRACE_MS)
+      .map((player) => player.id);
+    if (expiredPlayerIds.length > 0) {
+      room.players = room.players.filter((player) => !expiredPlayerIds.includes(player.id));
+      room.match?.stacking?.destroy();
+      room.match = null;
+      if (room.players.length === 0) {
+        rooms.delete(room.id);
+        return;
+      }
+      broadcastRoom(room);
+      return;
+    }
     const match = room.match;
     if (match?.phase === 'color_selection' && match.colorChoiceEndsAt !== null && now >= match.colorChoiceEndsAt) {
       startChessFromStack(room, match, 'white');
