@@ -131,6 +131,10 @@ export class MatchSocket {
     this.publishStatus('연결됨');
   }
 
+  forfeitMatch() {
+    this.send({ type: 'match_forfeit' });
+  }
+
   sendGameAction(action: unknown) {
     if (this.room === null) {
       return;

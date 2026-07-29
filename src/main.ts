@@ -132,6 +132,7 @@ class StackingScene extends Phaser.Scene {
   private networkMatch: MatchState | null = null;
   private networkChessStarted = false;
   private networkColorSelectionShown = false;
+  private networkSettlementShown = false;
   private removeMatchListener: (() => void) | null = null;
   private networkText!: Phaser.GameObjects.Text;
   private opponentRating = 1200;
@@ -155,6 +156,7 @@ class StackingScene extends Phaser.Scene {
   init(data: GameStartData) {
     this.mode = data.mode ?? 'single';
     this.opponentRating = data.opponentRating ?? 1200;
+    this.networkSettlementShown = false;
   }
 
   preload() {
@@ -173,7 +175,10 @@ class StackingScene extends Phaser.Scene {
     this.networkMatch = matchSocket.getMatch();
     this.removeMatchListener = matchSocket.onMatch((match) => {
       this.networkMatch = match;
-      if (this.mode === 'multiplayer') this.applyNetworkPhysics(match);
+      if (this.mode === 'multiplayer') {
+        this.applyNetworkPhysics(match);
+        if (match.phase === 'complete') this.showNetworkSettlement(match);
+      }
     });
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.removeMatchListener?.());
     this.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
@@ -189,6 +194,9 @@ class StackingScene extends Phaser.Scene {
     });
     this.input.keyboard?.on('keydown-R', () => this.resetRound());
     this.resetRound();
+    if (this.mode === 'multiplayer' && this.networkMatch?.phase === 'complete') {
+      this.showNetworkSettlement(this.networkMatch);
+    }
   }
 
   update(_time: number, delta: number) {
@@ -352,6 +360,15 @@ class StackingScene extends Phaser.Scene {
       fontFamily: 'system-ui, sans-serif',
       fontSize: '14px',
     }).setOrigin(1, 0);
+    if (this.mode === 'multiplayer') {
+      const forfeit = this.add.text(GAME_WIDTH - 28, 58, '기권하고 나가기', {
+        color: '#ffaaa5',
+        fontFamily: 'system-ui, sans-serif',
+        fontSize: '14px',
+        fontStyle: '700',
+      }).setInteractive({ useHandCursor: true }).setOrigin(1, 0);
+      forfeit.on('pointerdown', () => this.forfeitMatch());
+    }
     this.timerText = this.add.text(GAME_WIDTH / 2, 48, '', {
       align: 'center',
       color: '#f5f2e8',
@@ -523,6 +540,48 @@ class StackingScene extends Phaser.Scene {
       survivors: this.collectSurvivors(),
       winnerColor,
     });
+  }
+
+  private forfeitMatch() {
+    if (this.gameEnded || this.mode !== 'multiplayer') return;
+    this.gameEnded = true;
+    this.activePiece = null;
+    this.statusText.setText('기권을 서버에 전송했습니다…');
+    this.timerText.setText('—').setColor('#ffcf7c');
+    matchSocket.forfeitMatch();
+  }
+
+  private showNetworkSettlement(match: MatchState) {
+    if (this.networkSettlementShown) return;
+    this.networkSettlementShown = true;
+    this.gameEnded = true;
+    this.activePiece = null;
+
+    const result = match.winnerPlayerId === matchSocket.getClientId() ? 'win' : 'loss';
+    const settlement = settleProfile(result, this.opponentRating);
+    const title = result === 'win' ? '승리' : '패배';
+    const panel = this.add.container(GAME_WIDTH / 2, GAME_HEIGHT / 2).setDepth(80);
+    panel.add(this.add.rectangle(0, 0, 520, 350, 0x161c2d, 0.98).setStrokeStyle(3, 0xd5ddff));
+    panel.add(this.add.text(0, -106, `경기 결과 · ${title}`, {
+      color: result === 'win' ? '#b8e6a5' : '#ff8d8d',
+      fontFamily: 'system-ui, sans-serif', fontSize: '34px', fontStyle: '700',
+    }).setOrigin(0.5));
+    panel.add(this.add.text(0, -55, result === 'win' ? '상대가 기권했습니다' : '기권으로 경기가 종료되었습니다', {
+      color: '#d5ddff', fontFamily: 'system-ui, sans-serif', fontSize: '17px', align: 'center',
+    }).setOrigin(0.5));
+    panel.add(this.add.text(0, -5, `레이팅  ${settlement.previousRating} → ${settlement.currentRating}  (${settlement.delta >= 0 ? '+' : ''}${settlement.delta})`, {
+      color: settlement.delta > 0 ? '#b8e6a5' : '#ff8d8d',
+      fontFamily: 'system-ui, sans-serif', fontSize: '22px', fontStyle: '700',
+    }).setOrigin(0.5));
+    const button = this.add.rectangle(0, 95, 250, 52, 0x40527f, 1).setStrokeStyle(2, 0xcbd6ff).setInteractive({ useHandCursor: true });
+    const label = this.add.text(0, 95, '메인으로 돌아가기', {
+      color: '#f5f7ff', fontFamily: 'system-ui, sans-serif', fontSize: '18px', fontStyle: '700',
+    }).setOrigin(0.5);
+    button.on('pointerdown', () => {
+      matchSocket.leaveRoom();
+      this.scene.start('menu');
+    });
+    panel.add([button, label]);
   }
 
   private resetRound() {
@@ -1116,7 +1175,7 @@ class ChessScene extends Phaser.Scene {
       b: createClock('b', 1025, `${this.playerForColor('b')} · 흑`),
     };
     this.createControlButton(135, 320, '무승부 제안', () => this.offerDraw());
-    this.createControlButton(135, 380, '기권', () => this.resign());
+    this.createControlButton(135, 380, '기권하고 나가기', () => this.resign());
     this.drawAcceptButton = this.createControlButton(1025, 320, '무승부 수락', () => this.acceptDraw(), 0x4d785d);
     this.drawAcceptButton.setVisible(false);
     this.add.text(930, 380, '기보', {
@@ -1295,7 +1354,7 @@ class ChessScene extends Phaser.Scene {
     if (this.mode === 'multiplayer') {
       this.gameOver = true;
       this.messageText.setText('기권을 서버에 전송했습니다…').setColor('#ffcf7c');
-      matchSocket.forfeitChess('resign');
+      matchSocket.forfeitMatch();
       return;
     }
     const winner = this.chess.turn() === 'w' ? 'b' : 'w';

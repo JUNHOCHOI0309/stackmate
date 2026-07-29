@@ -46,6 +46,7 @@ type ClientMessage =
   | { type: 'join_room'; roomId: string }
   | { type: 'join_matchmaking'; rating: number }
   | { type: 'leave_room' }
+  | { type: 'match_forfeit' }
   | { type: 'stacking_drop'; angle: number; revision: number; x: number }
   | { type: 'select_chess_color'; color: PlayerColor }
   | { type: 'start_chess'; fen: string; whitePlayerId: string }
@@ -456,17 +457,24 @@ function handleChessMove(client: Client, message: Extract<ClientMessage, { type:
   broadcastRoom(room);
 }
 
-function handleChessForfeit(client: Client, reason: 'resign' | 'timeout') {
+function completeMatchForfeit(client: Client, reason: 'resign' | 'timeout', chessOnly = false) {
   const room = getRoomForClient(client);
   const match = room?.match;
-  if (room === undefined || match == null || match.phase !== 'chess') {
-    return rejectAction(client, '체스 단계가 아닙니다.');
+  if (room === undefined || match == null || match.phase === 'complete' || (chessOnly && match.phase !== 'chess')) {
+    return rejectAction(client, chessOnly ? '체스 단계가 아닙니다.' : '진행 중인 경기가 아닙니다.');
   }
   match.phase = 'complete';
   match.completionReason = reason;
   match.winnerPlayerId = room.players.find((player) => player.id !== client.id)?.id ?? null;
+  match.stacking?.destroy();
+  match.stacking = null;
+  match.stackingTurnPlayerId = null;
   match.revision += 1;
   broadcastRoom(room);
+}
+
+function handleChessForfeit(client: Client, reason: 'resign' | 'timeout') {
+  completeMatchForfeit(client, reason, true);
 }
 
 function parseMessage(data: RawData) {
@@ -514,6 +522,7 @@ wss.on('connection', (socket, request) => {
         : joinRoom(client, room);
     }
     if (message.type === 'leave_room') return leaveRoom(client);
+    if (message.type === 'match_forfeit') return completeMatchForfeit(client, 'resign');
     if (message.type === 'stacking_drop') return handleStackingDrop(client, message.revision, message.x, message.angle);
     if (message.type === 'select_chess_color') return handleChessColorSelection(client, message.color);
     if (message.type === 'start_chess') return handleStartChess(client, message.fen, message.whitePlayerId);
