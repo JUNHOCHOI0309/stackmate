@@ -1,0 +1,30 @@
+:root {
+  color: #f5f7ff;
+  background: #10131c;
+  font-family: system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  overflow: auto;
+  background: radial-gradient(circle at top, #202947, #10131c 60%);
+}
+
+#app {
+  width: min(100vw, 1450px);
+  margin: 0 auto;
+  border: 1px solid #323c59;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 35%);
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+}

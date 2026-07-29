@@ -35,3 +35,5 @@ Thumbs.db
 # Phaser / tooling caches
 .cache/
 .vite/
+node_modules/
+dist/
