@@ -50,9 +50,29 @@ npm run dev
 
 브라우저 두 개를 열어 `1:1 방 만들기`를 누르고, 생성된 `초대 링크 복사` 버튼의 URL을 다른 창에 열어 참가한다.
 
+Docker 컨테이너로 서버를 실행하는 경우에는 `npm run dev`가 아닌 아래 명령으로 클라이언트만 실행한다. `npm run dev`는 로컬 Node 서버도 함께 시작하므로 Docker가 사용하는 8787 포트와 충돌한다.
+
+```powershell
+docker compose up --build -d
+npm run client
+```
+
 ## 서버 컨테이너
 
-서버 이미지를 빌드·실행한다.
+서버 이미지를 빌드·실행한다. 로컬 개발에서는 Compose 명령 하나로 실행하는 것을 권장한다.
+
+```powershell
+docker compose up --build -d
+docker compose ps
+```
+
+중지할 때는 다음을 실행한다. 컨테이너만 제거하며 소스 코드나 Docker 이미지는 삭제하지 않는다.
+
+```powershell
+docker compose down
+```
+
+Compose를 쓰지 않을 경우에는 아래 명령으로 직접 이미지를 빌드·실행할 수도 있다.
 
 ```powershell
 docker build -t stackmate-ws .

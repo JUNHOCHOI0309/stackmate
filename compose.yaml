@@ -1,0 +1,16 @@
+services:
+  websocket:
+    build:
+      context: .
+    container_name: stackmate-ws-local
+    environment:
+      WS_PORT: 8787
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8787/health').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
