@@ -18,7 +18,6 @@ type ServerMatchState = {
   fen: string | null;
   colorChoiceEndsAt: number | null;
   colorSelectionWinnerId: string | null;
-  lastSnapshotAt: number;
   phase: 'chess' | 'color_selection' | 'complete' | 'stacking';
   revision: number;
   stacking: StackingSimulation | null;
@@ -110,7 +109,6 @@ function createMatchState(room: Room): ServerMatchState {
     completionReason: null,
     colorChoiceEndsAt: null,
     colorSelectionWinnerId: null,
-    lastSnapshotAt: 0,
     fen: null,
     phase: 'stacking',
     revision: 0,
@@ -464,9 +462,7 @@ setInterval(() => {
       broadcastRoom(room);
       return;
     }
-    if (now - match.lastSnapshotAt >= 33) {
-      match.lastSnapshotAt = now;
-      broadcastRoom(room);
-    }
+    // 물리 월드와 동일한 60Hz로 상태를 전송해 클라이언트 렌더링이 30Hz로 보이지 않게 한다.
+    broadcastRoom(room);
   });
 }, 1000 / 60);
