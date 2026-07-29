@@ -753,6 +753,7 @@ class StackingScene extends Phaser.Scene {
     this.networkChessStarted = true;
     this.scene.start('chess', {
       fen: match.fen,
+      localChessColor: match.whitePlayerId === matchSocket.getClientId() ? 'w' : 'b',
       mode: 'multiplayer',
       opponentRating: this.opponentRating,
       stackWinner,
@@ -862,6 +863,7 @@ class StackingScene extends Phaser.Scene {
 
 type ChessStartData = {
   fen?: string;
+  localChessColor?: Color;
   mode: GameMode;
   opponentRating: number;
   stackWinner: PlayerColor | null;
@@ -886,6 +888,7 @@ class ChessScene extends Phaser.Scene {
   private gameOver = false;
   private historyText!: Phaser.GameObjects.Text;
   private lastClockTickMs = Date.now();
+  private localChessColor: Color = 'w';
   private messageText!: Phaser.GameObjects.Text;
   private mode: GameMode = 'single';
   private moveText!: Phaser.GameObjects.Text;
@@ -893,12 +896,14 @@ class ChessScene extends Phaser.Scene {
   private pendingPromotion: { from: Square; to: Square } | null = null;
   private pieceSprites: Phaser.GameObjects.Image[] = [];
   private promotionUi: Phaser.GameObjects.Container | null = null;
+  private removeMatchListener: (() => void) | null = null;
   private selectedSquare: Square | null = null;
   private selectedTargets: Square[] = [];
   private stackWinner: PlayerColor | null = null;
   private survivorCounts: Record<PlayerColor, number> = { black: 0, white: 0 };
   private timerTexts!: Record<Color, Phaser.GameObjects.Text>;
   private whitePlayer: PlayerColor = 'white';
+  private networkSettlementShown = false;
 
   constructor() {
     super('chess');
@@ -920,6 +925,7 @@ class ChessScene extends Phaser.Scene {
     this.whitePlayer = data.stackWinner === null
       ? data.winnerColor
       : (data.winnerColor === 'white' ? data.stackWinner : this.opponent(data.stackWinner));
+    this.localChessColor = data.localChessColor ?? (this.whitePlayer === 'white' ? 'w' : 'b');
     const winnerSide: Color | null = data.stackWinner === null
       ? null
       : (data.winnerColor === 'white' ? 'w' : 'b');
@@ -940,6 +946,7 @@ class ChessScene extends Phaser.Scene {
     this.selectedSquare = null;
     this.selectedTargets = [];
     this.pendingPromotion = null;
+    this.networkSettlementShown = false;
   }
 
   create() {
@@ -947,6 +954,12 @@ class ChessScene extends Phaser.Scene {
     this.board = this.add.graphics().setDepth(1);
     this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => this.handleBoardInput(pointer));
     this.input.keyboard?.on('keydown-R', () => this.scene.start('stacking'));
+    if (this.mode === 'multiplayer') {
+      this.removeMatchListener = matchSocket.onMatch((match) => this.applyNetworkChessState(match));
+      const match = matchSocket.getMatch();
+      if (match !== null) this.applyNetworkChessState(match);
+      this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.removeMatchListener?.());
+    }
     this.renderBoard();
   }
 
@@ -963,6 +976,12 @@ class ChessScene extends Phaser.Scene {
     this.updateClocks();
     if (this.clocks[turn] === 0) {
       const winner = turn === 'w' ? 'b' : 'w';
+      if (this.mode === 'multiplayer') {
+        this.gameOver = true;
+        this.messageText.setText('시간 초과를 서버에 확인 중…').setColor('#ffcf7c');
+        matchSocket.forfeitChess('timeout');
+        return;
+      }
       this.finishGame(`${this.playerForColor(winner)} 승리 · 시간 초과`, winner);
       return;
     }
@@ -979,6 +998,31 @@ class ChessScene extends Phaser.Scene {
     const file = square.charCodeAt(0) - 97;
     const rank = Number(square[1]);
     return { file, rank, x: 280 + file * 75 + 37.5, y: 126 + (8 - rank) * 75 + 37.5 };
+  }
+
+  private applyNetworkChessState(match: MatchState) {
+    if (match.phase === 'chess' && match.fen !== null && this.chess.fen() !== match.fen) {
+      this.chess = new Chess(match.fen);
+      this.selectedSquare = null;
+      this.selectedTargets = [];
+      this.pendingPromotion = null;
+      this.lastClockTickMs = Date.now();
+      this.renderBoard();
+      return;
+    }
+    if (match.phase !== 'complete' || this.networkSettlementShown) return;
+    this.networkSettlementShown = true;
+    const winner: Color | null = match.winnerPlayerId === null
+      ? null
+      : match.winnerPlayerId === match.whitePlayerId ? 'w' : 'b';
+    const reason = {
+      checkmate: '체크메이트',
+      draw: '무승부',
+      resign: '기권',
+      timeout: '시간 초과',
+    }[match.completionReason ?? 'draw'];
+    const message = winner === null ? reason : `${this.playerForColor(winner)} 승리 · ${reason}`;
+    this.finishGame(message, winner);
   }
 
   private createChessFromSurvivors(survivors: SurvivorPiece[]) {
@@ -1132,6 +1176,10 @@ class ChessScene extends Phaser.Scene {
     const current = this.chess.get(square);
     const turn = this.chess.turn();
 
+    if (this.mode === 'multiplayer' && turn !== this.localChessColor) {
+      return;
+    }
+
     if (this.selectedSquare === null) {
       if (current?.color === turn) {
         this.selectSquare(square);
@@ -1163,6 +1211,17 @@ class ChessScene extends Phaser.Scene {
   }
 
   private completeMove(from: Square, to: Square, promotion?: PieceSymbol) {
+    if (this.mode === 'multiplayer') {
+      const match = matchSocket.getMatch();
+      if (match === null || match.phase !== 'chess') return;
+      const networkPromotion = promotion === 'b' || promotion === 'n' || promotion === 'q' || promotion === 'r' ? promotion : undefined;
+      matchSocket.submitChessMove(from, to, networkPromotion, match.revision);
+      this.selectedSquare = null;
+      this.selectedTargets = [];
+      this.messageText.setText('서버가 수를 검증 중입니다…').setColor('#b9c4dd');
+      this.renderBoard();
+      return;
+    }
     const turn = this.chess.turn();
     const move = this.chess.move({ from, to, promotion });
     if (move === null) {
@@ -1235,12 +1294,18 @@ class ChessScene extends Phaser.Scene {
     if (this.gameOver) {
       return;
     }
+    if (this.mode === 'multiplayer') {
+      this.gameOver = true;
+      this.messageText.setText('기권을 서버에 전송했습니다…').setColor('#ffcf7c');
+      matchSocket.forfeitChess('resign');
+      return;
+    }
     const winner = this.chess.turn() === 'w' ? 'b' : 'w';
     this.finishGame(`${this.playerForColor(winner)} 승리 · 기권`, winner);
   }
 
   private humanChessColor(): Color {
-    return this.whitePlayer === 'white' ? 'w' : 'b';
+    return this.localChessColor;
   }
 
   private isAiChessTurn() {

@@ -10,6 +10,7 @@ export type RoomState = {
 export type MatchState = {
   colorChoiceEndsAt: number | null;
   colorSelectionWinnerId: string | null;
+  completionReason: 'checkmate' | 'draw' | 'resign' | 'timeout' | null;
   fen: string | null;
   phase: 'chess' | 'color_selection' | 'complete' | 'stacking';
   revision: number;
@@ -130,6 +131,10 @@ export class MatchSocket {
 
   submitChessMove(from: string, to: string, promotion: 'b' | 'n' | 'q' | 'r' | undefined, revision: number) {
     this.send({ type: 'chess_move', from, promotion, revision, to });
+  }
+
+  forfeitChess(reason: 'resign' | 'timeout') {
+    this.send({ type: 'chess_forfeit', reason });
   }
 
   private handleMessage(message: ServerMessage) {

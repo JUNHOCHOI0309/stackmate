@@ -14,6 +14,7 @@ type Client = {
 
 type ServerMatchState = {
   chess: Chess | null;
+  completionReason: 'checkmate' | 'draw' | 'resign' | 'timeout' | null;
   fen: string | null;
   colorChoiceEndsAt: number | null;
   colorSelectionWinnerId: string | null;
@@ -42,6 +43,7 @@ type ClientMessage =
   | { type: 'select_chess_color'; color: PlayerColor }
   | { type: 'start_chess'; fen: string; whitePlayerId: string }
   | { type: 'chess_move'; from: string; promotion?: 'b' | 'n' | 'q' | 'r'; revision: number; to: string }
+  | { type: 'chess_forfeit'; reason: 'resign' | 'timeout' }
   | { type: 'game_action'; action: unknown };
 
 const port = Number(process.env.WS_PORT ?? 8787);
@@ -73,6 +75,7 @@ function send(socket: WebSocket, message: unknown) {
 function serializeMatchState(match: ServerMatchState | null) {
   if (match === null) return null;
   return {
+    completionReason: match.completionReason,
     fen: match.fen,
     colorChoiceEndsAt: match.colorChoiceEndsAt,
     colorSelectionWinnerId: match.colorSelectionWinnerId,
@@ -104,6 +107,7 @@ function broadcastRoom(room: Room) {
 function createMatchState(room: Room): ServerMatchState {
   return {
     chess: null,
+    completionReason: null,
     colorChoiceEndsAt: null,
     colorSelectionWinnerId: null,
     lastSnapshotAt: 0,
@@ -232,6 +236,7 @@ function handleStartChess(client: Client, fen: string, whitePlayerId: string) {
   }
   match.fen = match.chess.fen();
   match.phase = 'chess';
+  match.completionReason = null;
   match.revision += 1;
   match.stacking?.destroy();
   match.stacking = null;
@@ -338,11 +343,28 @@ function handleChessMove(client: Client, message: Extract<ClientMessage, { type:
   if (match.chess.isGameOver()) {
     match.phase = 'complete';
     if (match.chess.isCheckmate()) {
+      match.completionReason = 'checkmate';
       match.winnerPlayerId = match.chess.turn() === 'b'
         ? match.whitePlayerId
         : room.players.find((player) => player.id !== match.whitePlayerId)?.id ?? null;
+    } else {
+      match.completionReason = 'draw';
+      match.winnerPlayerId = null;
     }
   }
+  broadcastRoom(room);
+}
+
+function handleChessForfeit(client: Client, reason: 'resign' | 'timeout') {
+  const room = getRoomForClient(client);
+  const match = room?.match;
+  if (room === undefined || match == null || match.phase !== 'chess') {
+    return rejectAction(client, '체스 단계가 아닙니다.');
+  }
+  match.phase = 'complete';
+  match.completionReason = reason;
+  match.winnerPlayerId = room.players.find((player) => player.id !== client.id)?.id ?? null;
+  match.revision += 1;
   broadcastRoom(room);
 }
 
@@ -382,6 +404,7 @@ wss.on('connection', (socket, request) => {
     if (message.type === 'select_chess_color') return handleChessColorSelection(client, message.color);
     if (message.type === 'start_chess') return handleStartChess(client, message.fen, message.whitePlayerId);
     if (message.type === 'chess_move') return handleChessMove(client, message);
+    if (message.type === 'chess_forfeit') return handleChessForfeit(client, message.reason);
     if (message.type === 'game_action') {
       const room = getRoomForClient(client);
       if (room === undefined) return rejectAction(client, '게임 액션을 보낼 방에 참가하지 않았습니다.');
