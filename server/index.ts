@@ -252,19 +252,21 @@ function buildChessFen(survivors: SurvivorPiece[], whiteStackColor: PlayerColor)
   board.set('e1', { color: 'w', type: 'k' });
   board.set('e8', { color: 'b', type: 'k' });
   const pawnFiles = ['d', 'e', 'c', 'f', 'b', 'g', 'a', 'h'];
-  const whiteBackRankFiles = ['a', 'b', 'c', 'd', 'f', 'g', 'h'];
-  const blackBackRankFiles = ['h', 'g', 'f', 'd', 'c', 'b', 'a'];
   (['w', 'b'] as const).forEach((color) => {
     const stackColor: PlayerColor = color === 'w' ? whiteStackColor : (whiteStackColor === 'white' ? 'black' : 'white');
     const playerSurvivors = survivors.filter((piece) => piece.color === stackColor);
     const pawnRank = color === 'w' ? '2' : '7';
     const backRank = color === 'w' ? '1' : '8';
-    const backRankFiles = color === 'w' ? whiteBackRankFiles : blackBackRankFiles;
+    const specialFiles: Record<PieceKind, string[]> = color === 'w'
+      ? { rook: ['a', 'h'], knight: ['b', 'g'], bishop: ['c', 'f'], queen: ['d'], pawn: [] }
+      : { rook: ['h', 'a'], knight: ['g', 'b'], bishop: ['f', 'c'], queen: ['d'], pawn: [] };
     playerSurvivors.filter((piece) => piece.kind === 'pawn').slice(0, pawnFiles.length).forEach((_, index) => {
       board.set(`${pawnFiles[index]}${pawnRank}`, { color, type: 'p' });
     });
-    playerSurvivors.filter((piece) => piece.kind !== 'pawn').sort((a, b) => a.settledOrder - b.settledOrder).slice(0, backRankFiles.length).forEach((piece, index) => {
-      board.set(`${backRankFiles[index]}${backRank}`, { color, type: chessPieceType(piece.kind) });
+    (['rook', 'knight', 'bishop', 'queen'] as const).forEach((kind) => {
+      playerSurvivors.filter((piece) => piece.kind === kind).sort((a, b) => a.settledOrder - b.settledOrder).slice(0, specialFiles[kind].length).forEach((piece, index) => {
+        board.set(`${specialFiles[kind][index]}${backRank}`, { color, type: chessPieceType(piece.kind) });
+      });
     });
   });
   const rankFen = (rank: number) => {

@@ -1031,25 +1031,23 @@ class ChessScene extends Phaser.Scene {
     board.set('e8', { color: 'b', type: 'k' });
 
     const pawnFiles = ['d', 'e', 'c', 'f', 'b', 'g', 'a', 'h'];
-    const whiteBackRankFiles = ['a', 'b', 'c', 'd', 'f', 'g', 'h'];
-    const blackBackRankFiles = ['h', 'g', 'f', 'd', 'c', 'b', 'a'];
-
     (['w', 'b'] as const).forEach((color) => {
       const player = color === 'w' ? this.whitePlayer : this.opponent(this.whitePlayer);
       const playerSurvivors = survivors.filter((piece) => piece.color === player);
       const rank = color === 'w' ? '1' : '8';
       const pawnRank = color === 'w' ? '2' : '7';
-      const backRankFiles = color === 'w' ? whiteBackRankFiles : blackBackRankFiles;
+      const specialFiles: Record<PieceKind, string[]> = color === 'w'
+        ? { rook: ['a', 'h'], knight: ['b', 'g'], bishop: ['c', 'f'], queen: ['d'], pawn: [] }
+        : { rook: ['h', 'a'], knight: ['g', 'b'], bishop: ['f', 'c'], queen: ['d'], pawn: [] };
       const pawns = playerSurvivors.filter((piece) => piece.kind === 'pawn');
-      const specialPieces = playerSurvivors
-        .filter((piece) => piece.kind !== 'pawn')
-        .sort((a, b) => a.settledOrder - b.settledOrder);
 
       pawns.slice(0, pawnFiles.length).forEach((_, index) => {
         board.set(`${pawnFiles[index]}${pawnRank}` as Square, { color, type: 'p' });
       });
-      specialPieces.slice(0, backRankFiles.length).forEach((piece, index) => {
-        board.set(`${backRankFiles[index]}${rank}` as Square, { color, type: CHESS_PIECE_TYPE[piece.kind] });
+      (['rook', 'knight', 'bishop', 'queen'] as const).forEach((kind) => {
+        playerSurvivors.filter((piece) => piece.kind === kind).sort((a, b) => a.settledOrder - b.settledOrder).slice(0, specialFiles[kind].length).forEach((piece, index) => {
+          board.set(`${specialFiles[kind][index]}${rank}` as Square, { color, type: CHESS_PIECE_TYPE[piece.kind] });
+        });
       });
     });
 
