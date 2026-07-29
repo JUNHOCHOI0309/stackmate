@@ -11,6 +11,12 @@ export type MatchState = {
   fen: string | null;
   phase: 'chess' | 'complete' | 'stacking';
   revision: number;
+  stacking: {
+    isDropping: boolean;
+    nextPiece: { color: 'black' | 'white'; kind: 'bishop' | 'knight' | 'pawn' | 'queen' | 'rook' } | null;
+    pieces: Array<{ angle: number; color: 'black' | 'white'; id: string; kind: 'bishop' | 'knight' | 'pawn' | 'queen' | 'rook'; settledOrder: number; x: number; y: number }>;
+    turnEndsAt: number;
+  } | null;
   stackingTurnPlayerId: string | null;
   winnerPlayerId: string | null;
   whitePlayerId: string | null;
@@ -68,6 +74,10 @@ export class MatchSocket {
     return this.clientId;
   }
 
+  getMatch() {
+    return this.room?.match ?? null;
+  }
+
   createPrivateRoom() {
     this.send({ type: 'create_room' });
   }
@@ -88,8 +98,8 @@ export class MatchSocket {
     this.send({ type: 'game_action', action });
   }
 
-  submitStackingDrop(revision: number) {
-    this.send({ type: 'stacking_drop', revision });
+  submitStackingDrop(revision: number, x: number, angle: number) {
+    this.send({ type: 'stacking_drop', angle, revision, x });
   }
 
   startAuthoritativeChess(fen: string, whitePlayerId: string) {

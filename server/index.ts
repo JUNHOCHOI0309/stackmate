@@ -1,6 +1,8 @@
 import { Chess } from 'chess.js';
+import RAPIER from '@dimforge/rapier2d-compat';
 import { createServer } from 'node:http';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
+import { StackingSimulation, type PlayerColor } from './stacking';
 
 type Client = {
   id: string;
@@ -14,6 +16,7 @@ type ServerMatchState = {
   fen: string | null;
   phase: 'chess' | 'complete' | 'stacking';
   revision: number;
+  stacking: StackingSimulation | null;
   stackingTurnPlayerId: string | null;
   winnerPlayerId: string | null;
   whitePlayerId: string | null;
@@ -31,7 +34,7 @@ type ClientMessage =
   | { type: 'join_room'; roomId: string }
   | { type: 'join_matchmaking'; rating: number }
   | { type: 'leave_room' }
-  | { type: 'stacking_drop'; revision: number }
+  | { type: 'stacking_drop'; angle: number; revision: number; x: number }
   | { type: 'start_chess'; fen: string; whitePlayerId: string }
   | { type: 'chess_move'; from: string; promotion?: 'b' | 'n' | 'q' | 'r'; revision: number; to: string }
   | { type: 'game_action'; action: unknown };
@@ -51,6 +54,8 @@ const clients = new Map<WebSocket, Client>();
 const matchmakingQueue = new Set<Client>();
 const rooms = new Map<string, Room>();
 
+await RAPIER.init();
+
 function createId(length = 6) {
   return Math.random().toString(36).slice(2, 2 + length).toUpperCase();
 }
@@ -65,6 +70,7 @@ function serializeMatchState(match: ServerMatchState | null) {
     fen: match.fen,
     phase: match.phase,
     revision: match.revision,
+    stacking: match.stacking?.snapshot() ?? null,
     stackingTurnPlayerId: match.stackingTurnPlayerId,
     winnerPlayerId: match.winnerPlayerId,
     whitePlayerId: match.whitePlayerId,
@@ -93,6 +99,7 @@ function createMatchState(room: Room): ServerMatchState {
     fen: null,
     phase: 'stacking',
     revision: 0,
+    stacking: new StackingSimulation(),
     stackingTurnPlayerId: room.players[0]?.id ?? null,
     winnerPlayerId: null,
     whitePlayerId: null,
@@ -115,6 +122,7 @@ function leaveRoom(client: Client) {
   if (room === undefined) return;
   room.players = room.players.filter((player) => player.id !== client.id);
   if (room.players.length === 0) {
+    room.match?.stacking?.destroy();
     rooms.delete(room.id);
     return;
   }
@@ -152,18 +160,24 @@ function joinMatchmaking(client: Client, rating: number) {
   joinRoom(client, room);
 }
 
-function handleStackingDrop(client: Client, revision: number) {
+function playerForStackColor(room: Room, color: PlayerColor) {
+  return room.players[color === 'white' ? 0 : 1];
+}
+
+function handleStackingDrop(client: Client, revision: number, x: number, angle: number) {
   const room = getRoomForClient(client);
   const match = room?.match;
-  if (room === undefined || match == null || match.phase !== 'stacking') {
+  if (room === undefined || match == null || match.phase !== 'stacking' || match.stacking === null) {
     rejectAction(client, '쌓기 단계가 아닙니다.');
     return;
   }
   if (revision !== match.revision || match.stackingTurnPlayerId !== client.id) {
     return rejectAction(client, '현재 쌓기 턴이 아니거나 상태가 오래되었습니다.');
   }
+  if (!Number.isFinite(x) || !Number.isFinite(angle) || !match.stacking.drop(x, angle)) {
+    return rejectAction(client, '현재 기물을 떨어뜨릴 수 없습니다.');
+  }
   match.revision += 1;
-  match.stackingTurnPlayerId = room.players.find((player) => player.id !== client.id)?.id ?? null;
   broadcastRoom(room);
 }
 
@@ -186,6 +200,8 @@ function handleStartChess(client: Client, fen: string, whitePlayerId: string) {
   match.fen = match.chess.fen();
   match.phase = 'chess';
   match.revision += 1;
+  match.stacking?.destroy();
+  match.stacking = null;
   match.stackingTurnPlayerId = null;
   match.whitePlayerId = whitePlayerId;
   broadcastRoom(room);
@@ -258,7 +274,7 @@ wss.on('connection', (socket) => {
       return room === undefined ? rejectAction(client, '방을 찾을 수 없습니다.') : joinRoom(client, room);
     }
     if (message.type === 'leave_room') return leaveRoom(client);
-    if (message.type === 'stacking_drop') return handleStackingDrop(client, message.revision);
+    if (message.type === 'stacking_drop') return handleStackingDrop(client, message.revision, message.x, message.angle);
     if (message.type === 'start_chess') return handleStartChess(client, message.fen, message.whitePlayerId);
     if (message.type === 'chess_move') return handleChessMove(client, message);
     if (message.type === 'game_action') {
@@ -277,3 +293,28 @@ wss.on('connection', (socket) => {
 httpServer.listen(port, () => {
   console.log(`STACKMATE WebSocket server listening on ws://localhost:${port}`);
 });
+
+setInterval(() => {
+  const now = Date.now();
+  rooms.forEach((room) => {
+    const match = room.match;
+    if (match?.phase !== 'stacking' || match.stacking === null) return;
+    const result = match.stacking.tick(now);
+    if (result.outcome !== null) {
+      match.phase = 'complete';
+      match.winnerPlayerId = playerForStackColor(room, result.outcome === 'white' ? 'black' : 'white')?.id ?? null;
+      match.stackingTurnPlayerId = null;
+      match.revision += 1;
+      broadcastRoom(room);
+      return;
+    }
+    const nextPlayer = playerForStackColor(room, match.stacking.getTurn())?.id ?? null;
+    if (result.changed || match.stackingTurnPlayerId !== nextPlayer) {
+      match.stackingTurnPlayerId = nextPlayer;
+      if (result.changed) match.revision += 1;
+      broadcastRoom(room);
+      return;
+    }
+    if (now % 100 < 17) broadcastRoom(room);
+  });
+}, 1000 / 60);

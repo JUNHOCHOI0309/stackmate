@@ -2,7 +2,7 @@ import Phaser from 'phaser';
 import RAPIER, { type RigidBody, type World } from '@dimforge/rapier2d-compat';
 import { Chess, type Color, type PieceSymbol, type Square } from 'chess.js';
 import { MenuScene } from './menu';
-import { matchSocket } from './network';
+import { matchSocket, type MatchState } from './network';
 import { settleProfile, type GameMode } from './profile';
 import './style.css';
 
@@ -28,6 +28,7 @@ type StackPiece = {
   kind: PieceKind;
   outline?: Phaser.GameObjects.Image;
   previousY: number;
+  serverId?: string;
   settledOrder: number;
   sprite: Phaser.GameObjects.Image;
   width: number;
@@ -127,6 +128,8 @@ class StackingScene extends Phaser.Scene {
   private lastDroppedBy: PlayerColor | null = null;
   private lastTimerTickMs = Date.now();
   private mode: GameMode = 'single';
+  private networkMatch: MatchState | null = null;
+  private removeMatchListener: (() => void) | null = null;
   private networkText!: Phaser.GameObjects.Text;
   private opponentRating = 1200;
   private platformGraphics: Phaser.GameObjects.Graphics | null = null;
@@ -164,16 +167,22 @@ class StackingScene extends Phaser.Scene {
     this.createUi();
     matchSocket.onStatus((status) => this.networkText?.setText(`WebSocket · ${status}`));
     matchSocket.connect();
+    this.networkMatch = matchSocket.getMatch();
+    this.removeMatchListener = matchSocket.onMatch((match) => {
+      this.networkMatch = match;
+      if (this.mode === 'multiplayer') this.applyNetworkPhysics(match);
+    });
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.removeMatchListener?.());
     this.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
-      if (this.activePiece !== null && !this.gameEnded && !this.isAiStackTurn()) {
+      if (this.activePiece !== null && !this.gameEnded && this.canControlActivePiece()) {
         this.targetX = Phaser.Math.Clamp(pointer.x, PLATFORM_CENTER_X - 250, PLATFORM_CENTER_X + 250);
       }
     });
     this.input.on('pointerdown', () => {
-      if (!this.isAiStackTurn()) this.dropActivePiece();
+      if (this.canControlActivePiece()) this.dropActivePiece();
     });
     this.input.keyboard?.on('keydown-SPACE', () => {
-      if (!this.isAiStackTurn()) this.dropActivePiece();
+      if (this.canControlActivePiece()) this.dropActivePiece();
     });
     this.input.keyboard?.on('keydown-R', () => this.resetRound());
     this.resetRound();
@@ -182,6 +191,10 @@ class StackingScene extends Phaser.Scene {
   update(_time: number, delta: number) {
     if (this.colorSelectionWinner !== null) {
       this.updateColorSelectionTimer();
+      return;
+    }
+    if (this.mode === 'multiplayer') {
+      this.updateNetworkStacking();
       return;
     }
     if (!this.gameEnded && this.activePiece !== null) {
@@ -357,6 +370,18 @@ class StackingScene extends Phaser.Scene {
       return;
     }
 
+    if (this.mode === 'multiplayer') {
+      const match = this.networkMatch;
+      if (match === null || match.stacking === null || !this.canControlActivePiece()) return;
+      const activePiece = this.activePiece;
+      matchSocket.submitStackingDrop(match.revision, this.targetX, this.activeAngle);
+      this.removePiece(activePiece);
+      this.activePiece = null;
+      this.statusText.setText('서버 물리 시뮬레이션 응답 대기 중…');
+      this.timerText.setText('—').setColor('#b9c4dd');
+      return;
+    }
+
     this.activePiece.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
     this.activePiece.body.setLinearDamping(0.08);
     this.activePiece.body.setAngularDamping(0.2);
@@ -446,6 +471,15 @@ class StackingScene extends Phaser.Scene {
     return this.mode === 'single' && this.activePiece?.color === 'black';
   }
 
+  private canControlActivePiece() {
+    if (this.mode !== 'multiplayer') return !this.isAiStackTurn();
+    const match = this.networkMatch;
+    return match?.phase === 'stacking'
+      && match.stacking !== null
+      && !match.stacking.isDropping
+      && match.stackingTurnPlayerId === matchSocket.getClientId();
+  }
+
   private updateAiStackTurn() {
     if (Date.now() < this.aiActionAt) {
       return;
@@ -493,10 +527,7 @@ class StackingScene extends Phaser.Scene {
     this.children.getChildren()
       .filter((child) => child.name === 'chess-action')
       .forEach((child) => child.destroy());
-    this.pieces.forEach((piece) => {
-      piece.outline?.destroy();
-      piece.sprite.destroy();
-    });
+    this.pieces.forEach((piece) => this.removePiece(piece));
     this.pieces = [];
     this.world?.free();
     this.world = new RAPIER.World({ x: 0, y: 400 });
@@ -522,6 +553,11 @@ class StackingScene extends Phaser.Scene {
     this.lastTimerTickMs = Date.now();
     this.turnCount = 0;
     this.createPlatform();
+    if (this.mode === 'multiplayer') {
+      this.statusText.setText('서버 쌓기 상태를 불러오는 중…');
+      if (this.networkMatch !== null) this.applyNetworkPhysics(this.networkMatch);
+      return;
+    }
     this.spawnNextPiece();
   }
 
@@ -636,6 +672,59 @@ class StackingScene extends Phaser.Scene {
     }
   }
 
+  private applyNetworkPhysics(match: MatchState) {
+    if (match.phase !== 'stacking' || match.stacking === null) {
+      this.gameEnded = match.phase === 'complete';
+      if (match.phase === 'complete') this.statusText.setText('서버가 쌓기 결과를 확정했습니다. 체스 전환은 다음 단계에서 연결됩니다.');
+      return;
+    }
+    const snapshot = match.stacking;
+    const serverIds = new Set(snapshot.pieces.map((piece) => piece.id));
+    this.pieces.filter((piece) => piece.serverId !== undefined && !serverIds.has(piece.serverId)).forEach((piece) => this.removePiece(piece));
+
+    for (const serverPiece of snapshot.pieces) {
+      let piece = this.pieces.find((candidate) => candidate.serverId === serverPiece.id);
+      if (piece === undefined) {
+        piece = this.createPiece(serverPiece.kind, serverPiece.color);
+        piece.serverId = serverPiece.id;
+        this.pieces.push(piece);
+      }
+      piece.settledOrder = serverPiece.settledOrder;
+      piece.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
+      piece.body.setTranslation({ x: serverPiece.x, y: serverPiece.y }, true);
+      piece.body.setRotation(serverPiece.angle, true);
+    }
+
+    if (snapshot.isDropping || snapshot.nextPiece === null) {
+      if (this.activePiece !== null) {
+        this.removePiece(this.activePiece);
+        this.activePiece = null;
+      }
+    } else {
+      const next = snapshot.nextPiece;
+      if (this.activePiece === null || this.activePiece.kind !== next.kind || this.activePiece.color !== next.color) {
+        if (this.activePiece !== null) this.removePiece(this.activePiece);
+        this.activeAngle = 0;
+        this.targetX = PLATFORM_CENTER_X;
+        this.activePiece = this.createPiece(next.kind, next.color);
+        this.pieces.push(this.activePiece);
+      }
+      this.player = next.color;
+    }
+
+    this.turnTimeRemaining = Math.max(0, snapshot.turnEndsAt - Date.now());
+    this.playerText.setText(`${PLAYER_LABEL[this.player]}의 차례 · 서버 권위 물리`);
+    this.statusText.setText(this.canControlActivePiece() ? '위치를 정한 뒤 낙하하세요' : '상대 또는 서버 물리 시뮬레이션 진행 중…');
+    this.syncSprites();
+  }
+
+  private removePiece(piece: StackPiece) {
+    piece.outline?.destroy();
+    piece.sprite.destroy();
+    this.world.removeRigidBody(piece.body);
+    this.pieces = this.pieces.filter((candidate) => candidate !== piece);
+  }
+
   private sourceTextureKey(kind: PieceKind, color: PlayerColor) {
     return `source-${kind}-${color}`;
   }
@@ -690,8 +779,22 @@ class StackingScene extends Phaser.Scene {
     }
 
     this.targetX = Phaser.Math.Clamp(this.targetX, PLATFORM_CENTER_X - 250, PLATFORM_CENTER_X + 250);
+    if (this.mode === 'multiplayer') {
+      activePiece.body.setTranslation({ x: this.targetX, y: SPAWN_Y }, true);
+      activePiece.body.setRotation(this.activeAngle, true);
+      this.syncSprites();
+      return;
+    }
     activePiece.body.setNextKinematicTranslation({ x: this.targetX, y: SPAWN_Y });
     activePiece.body.setNextKinematicRotation(this.activeAngle);
+  }
+
+  private updateNetworkStacking() {
+    const match = this.networkMatch;
+    if (match?.phase !== 'stacking' || match.stacking === null) return;
+    if (this.activePiece !== null && this.canControlActivePiece()) this.updateActivePiece(16);
+    const remaining = Math.max(0, match.stacking.turnEndsAt - Date.now());
+    this.timerText.setText((remaining / 1000).toFixed(1)).setColor(remaining <= 3_000 ? '#ff8d8d' : '#f5f2e8');
   }
 }
 
