@@ -3,7 +3,7 @@ import RAPIER from '@dimforge/rapier2d-compat';
 import { randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
-import { StackingSimulation, type PieceKind, type PlayerColor, type SurvivorPiece } from './stacking';
+import { StackingSimulation, type PieceKind, type PlayerColor, type StackingSnapshot, type SurvivorPiece } from './stacking';
 
 type Client = {
   disconnectedAt: number | null;
@@ -19,6 +19,7 @@ type ServerMatchState = {
   chess: Chess | null;
   completionReason: 'checkmate' | 'draw' | 'resign' | 'timeout' | null;
   fen: string | null;
+  lastPhysicsSnapshotAt: number;
   colorChoiceEndsAt: number | null;
   colorSelectionWinnerId: string | null;
   phase: 'chess' | 'color_selection' | 'complete' | 'stacking';
@@ -55,6 +56,7 @@ type ClientMessage =
   | { type: 'game_action'; action: unknown };
 
 const port = Number(process.env.PORT ?? process.env.WS_PORT ?? 8787);
+const PHYSICS_SNAPSHOT_INTERVAL_MS = 1_000 / 20;
 const httpServer = createServer((request, response) => {
   if (request.url === '/health') {
     response.writeHead(200, { 'content-type': 'application/json' });
@@ -170,6 +172,11 @@ function broadcastRoom(room: Room) {
   room.players.forEach((player) => send(player.socket, { type: 'room_state', ...roomSnapshot(room, player) }));
 }
 
+function broadcastPhysicsSnapshot(room: Room, match: ServerMatchState, stacking: StackingSnapshot) {
+  const message = { type: 'physics_snapshot', roomId: room.id, revision: match.revision, stacking };
+  room.players.forEach((player) => send(player.socket, message));
+}
+
 function createMatchState(room: Room): ServerMatchState {
   return {
     chess: null,
@@ -177,6 +184,7 @@ function createMatchState(room: Room): ServerMatchState {
     colorChoiceEndsAt: null,
     colorSelectionWinnerId: null,
     fen: null,
+    lastPhysicsSnapshotAt: Date.now(),
     phase: 'stacking',
     revision: 0,
     stacking: new StackingSimulation(),
@@ -599,7 +607,12 @@ setInterval(() => {
       broadcastRoom(room);
       return;
     }
-    // 물리 월드와 동일한 60Hz로 상태를 전송해 클라이언트 렌더링이 30Hz로 보이지 않게 한다.
-    broadcastRoom(room);
+    if (now - match.lastPhysicsSnapshotAt >= PHYSICS_SNAPSHOT_INTERVAL_MS) {
+      match.lastPhysicsSnapshotAt += PHYSICS_SNAPSHOT_INTERVAL_MS;
+      if (now - match.lastPhysicsSnapshotAt >= PHYSICS_SNAPSHOT_INTERVAL_MS) {
+        match.lastPhysicsSnapshotAt = now;
+      }
+      broadcastPhysicsSnapshot(room, match, match.stacking.snapshot());
+    }
   });
 }, 1000 / 60);

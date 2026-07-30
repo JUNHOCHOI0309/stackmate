@@ -8,6 +8,13 @@ export type RoomState = {
   roomId: string;
 };
 
+export type StackingState = {
+  isDropping: boolean;
+  nextPiece: { color: 'black' | 'white'; kind: 'bishop' | 'knight' | 'pawn' | 'queen' | 'rook' } | null;
+  pieces: Array<{ angle: number; color: 'black' | 'white'; id: string; kind: 'bishop' | 'knight' | 'pawn' | 'queen' | 'rook'; settledOrder: number; x: number; y: number }>;
+  turnEndsAt: number;
+};
+
 export type MatchState = {
   colorChoiceEndsAt: number | null;
   colorSelectionWinnerId: string | null;
@@ -15,12 +22,7 @@ export type MatchState = {
   fen: string | null;
   phase: 'chess' | 'color_selection' | 'complete' | 'stacking';
   revision: number;
-  stacking: {
-    isDropping: boolean;
-    nextPiece: { color: 'black' | 'white'; kind: 'bishop' | 'knight' | 'pawn' | 'queen' | 'rook' } | null;
-    pieces: Array<{ angle: number; color: 'black' | 'white'; id: string; kind: 'bishop' | 'knight' | 'pawn' | 'queen' | 'rook'; settledOrder: number; x: number; y: number }>;
-    turnEndsAt: number;
-  } | null;
+  stacking: StackingState | null;
   stackingTurnPlayerId: string | null;
   winnerPlayerId: string | null;
   whitePlayerId: string | null;
@@ -29,6 +31,7 @@ export type MatchState = {
 type ServerMessage =
   | { type: 'connected'; clientId: string }
   | ({ type: 'room_state' } & RoomState)
+  | { type: 'physics_snapshot'; revision: number; roomId: string; stacking: StackingState }
   | { type: 'room_closed'; message: string }
   | { type: 'matchmaking_wait'; rating: number }
   | { type: 'error'; message: string }
@@ -180,6 +183,15 @@ export class MatchSocket {
       this.roomListeners.forEach((listener) => listener(message));
       const match = message.match;
       if (match !== null) this.matchListeners.forEach((listener) => listener(match));
+      return;
+    }
+    if (message.type === 'physics_snapshot') {
+      if (this.room === null || this.room.roomId !== message.roomId || this.room.match === null || this.room.match.phase !== 'stacking') {
+        return;
+      }
+      const match = { ...this.room.match, revision: message.revision, stacking: message.stacking };
+      this.room = { ...this.room, match };
+      this.matchListeners.forEach((listener) => listener(match));
       return;
     }
     if (message.type === 'room_closed') {

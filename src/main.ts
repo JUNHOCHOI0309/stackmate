@@ -2,7 +2,7 @@ import Phaser from 'phaser';
 import RAPIER, { type RigidBody, type World } from '@dimforge/rapier2d-compat';
 import { Chess, type Color, type PieceSymbol, type Square } from 'chess.js';
 import { MenuScene } from './menu';
-import { matchSocket, type MatchState } from './network';
+import { matchSocket, type MatchState, type StackingState } from './network';
 import { settleProfile, type GameMode } from './profile';
 import './style.css';
 
@@ -29,13 +29,14 @@ type StackPiece = {
   outline?: Phaser.GameObjects.Image;
   previousY: number;
   serverId?: string;
-  serverTarget?: { angle: number; x: number; y: number };
+  networkTransform?: { angle: number; x: number; y: number };
   settledOrder: number;
   sprite: Phaser.GameObjects.Image;
   width: number;
 };
 
 type SurvivorPiece = Pick<StackPiece, 'color' | 'kind' | 'settledOrder'>;
+type NetworkSnapshot = { receivedAt: number; stacking: StackingState };
 
 type GameStartData = {
   mode?: GameMode;
@@ -132,6 +133,7 @@ class StackingScene extends Phaser.Scene {
   private networkMatch: MatchState | null = null;
   private networkChessStarted = false;
   private networkColorSelectionShown = false;
+  private networkSnapshots: NetworkSnapshot[] = [];
   private networkSettlementShown = false;
   private removeMatchListener: (() => void) | null = null;
   private networkText!: Phaser.GameObjects.Text;
@@ -140,6 +142,7 @@ class StackingScene extends Phaser.Scene {
   private player: PlayerColor = 'white';
   private playerText!: Phaser.GameObjects.Text;
   private pieces: StackPiece[] = [];
+  private predictedDrop: { piece: StackPiece; velocityY: number } | null = null;
   private settleDuration = 0;
   private settledPieceCount = 0;
   private statusText!: Phaser.GameObjects.Text;
@@ -156,7 +159,9 @@ class StackingScene extends Phaser.Scene {
   init(data: GameStartData) {
     this.mode = data.mode ?? 'single';
     this.opponentRating = data.opponentRating ?? 1200;
+    this.networkSnapshots = [];
     this.networkSettlementShown = false;
+    this.predictedDrop = null;
   }
 
   preload() {
@@ -395,9 +400,9 @@ class StackingScene extends Phaser.Scene {
       if (match === null || match.stacking === null || !this.canControlActivePiece()) return;
       const activePiece = this.activePiece;
       matchSocket.submitStackingDrop(match.revision, this.targetX, this.activeAngle);
-      this.removePiece(activePiece);
+      this.predictedDrop = { piece: activePiece, velocityY: 0 };
       this.activePiece = null;
-      this.statusText.setText('서버 물리 시뮬레이션 응답 대기 중…');
+      this.statusText.setText('낙하 중 · 서버 판정 동기화 중…');
       this.timerText.setText('—').setColor('#b9c4dd');
       return;
     }
@@ -527,7 +532,7 @@ class StackingScene extends Phaser.Scene {
 
   private collectSurvivors(): SurvivorPiece[] {
     return this.pieces
-      .filter((piece) => piece !== this.activePiece && piece.body.translation().y <= FALL_LINE_Y)
+      .filter((piece) => piece !== this.activePiece && (piece.networkTransform?.y ?? piece.body.translation().y) <= FALL_LINE_Y)
       .map(({ color, kind, settledOrder }) => ({ color, kind, settledOrder }));
   }
 
@@ -744,21 +749,27 @@ class StackingScene extends Phaser.Scene {
       return;
     }
     const snapshot = match.stacking;
+    this.pushNetworkSnapshot(snapshot);
     const serverIds = new Set(snapshot.pieces.map((piece) => piece.id));
     this.pieces.filter((piece) => piece.serverId !== undefined && !serverIds.has(piece.serverId)).forEach((piece) => this.removePiece(piece));
 
     for (const serverPiece of snapshot.pieces) {
       let piece = this.pieces.find((candidate) => candidate.serverId === serverPiece.id);
+      if (piece === undefined && this.predictedDrop?.piece.kind === serverPiece.kind && this.predictedDrop.piece.color === serverPiece.color) {
+        piece = this.predictedDrop.piece;
+        piece.serverId = serverPiece.id;
+        this.predictedDrop = null;
+      }
       if (piece === undefined) {
         piece = this.createPiece(serverPiece.kind, serverPiece.color);
         piece.serverId = serverPiece.id;
         this.pieces.push(piece);
         piece.body.setTranslation({ x: serverPiece.x, y: serverPiece.y }, true);
         piece.body.setRotation(serverPiece.angle, true);
+        piece.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
       }
       piece.settledOrder = serverPiece.settledOrder;
-      piece.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
-      piece.serverTarget = { angle: serverPiece.angle, x: serverPiece.x, y: serverPiece.y };
+      piece.networkTransform = { angle: serverPiece.angle, x: serverPiece.x, y: serverPiece.y };
     }
 
     if (snapshot.isDropping || snapshot.nextPiece === null) {
@@ -787,6 +798,36 @@ class StackingScene extends Phaser.Scene {
       this.statusText.setText(this.canControlActivePiece() ? '위치를 정한 뒤 낙하하세요' : '상대 또는 서버 물리 시뮬레이션 진행 중…');
     }
     this.syncSprites();
+  }
+
+  private pushNetworkSnapshot(stacking: StackingState) {
+    const receivedAt = performance.now();
+    const latest = this.networkSnapshots.at(-1);
+    if (latest !== undefined && latest.stacking === stacking) return;
+    this.networkSnapshots.push({ receivedAt, stacking });
+    if (this.networkSnapshots.length > 5) this.networkSnapshots.shift();
+  }
+
+  private interpolatedNetworkSnapshot() {
+    const snapshots = this.networkSnapshots;
+    if (snapshots.length === 0) return null;
+    const renderAt = performance.now() - 100;
+    const previous = [...snapshots].reverse().find((snapshot) => snapshot.receivedAt <= renderAt) ?? snapshots[0];
+    const next = snapshots.find((snapshot) => snapshot.receivedAt >= renderAt) ?? snapshots.at(-1)!;
+    const span = Math.max(1, next.receivedAt - previous.receivedAt);
+    const progress = Phaser.Math.Clamp((renderAt - previous.receivedAt) / span, 0, 1);
+    const previousPieces = new Map(previous.stacking.pieces.map((piece) => [piece.id, piece]));
+
+    return next.stacking.pieces.map((nextPiece) => {
+      const previousPiece = previousPieces.get(nextPiece.id);
+      if (previousPiece === undefined) return nextPiece;
+      return {
+        ...nextPiece,
+        angle: previousPiece.angle + Phaser.Math.Angle.Wrap(nextPiece.angle - previousPiece.angle) * progress,
+        x: Phaser.Math.Linear(previousPiece.x, nextPiece.x, progress),
+        y: Phaser.Math.Linear(previousPiece.y, nextPiece.y, progress),
+      };
+    });
   }
 
   private showNetworkColorSelection(match: MatchState) {
@@ -834,9 +875,11 @@ class StackingScene extends Phaser.Scene {
 
   private syncSprites() {
     for (const piece of this.pieces) {
-      const position = piece.body.translation();
-      piece.outline?.setPosition(position.x, position.y).setRotation(piece.body.rotation());
-      piece.sprite.setPosition(position.x, position.y).setRotation(piece.body.rotation());
+      const transform = piece.networkTransform;
+      const position = transform ?? piece.body.translation();
+      const rotation = transform?.angle ?? piece.body.rotation();
+      piece.outline?.setPosition(position.x, position.y).setRotation(rotation);
+      piece.sprite.setPosition(position.x, position.y).setRotation(rotation);
       piece.previousY = position.y;
     }
   }
@@ -895,16 +938,13 @@ class StackingScene extends Phaser.Scene {
   private updateNetworkStacking(delta: number) {
     const match = this.networkMatch;
     if (match === null || match === undefined || match.stacking === null) return;
-    const blend = 1 - Math.exp((-delta * 14) / 1000);
-    this.pieces.forEach((piece) => {
-      if (piece.serverTarget === undefined) return;
-      const current = piece.body.translation();
-      const rotation = piece.body.rotation();
-      piece.body.setTranslation({
-        x: Phaser.Math.Linear(current.x, piece.serverTarget.x, blend),
-        y: Phaser.Math.Linear(current.y, piece.serverTarget.y, blend),
-      }, true);
-      piece.body.setRotation(rotation + Phaser.Math.Angle.Wrap(piece.serverTarget.angle - rotation) * blend, true);
+    this.updatePredictedDrop(delta);
+    const interpolatedPieces = this.interpolatedNetworkSnapshot();
+    interpolatedPieces?.forEach((transform) => {
+      const piece = this.pieces.find((candidate) => candidate.serverId === transform.id);
+      if (piece === undefined) return;
+      piece.networkTransform = { angle: transform.angle, x: transform.x, y: transform.y };
+      piece.settledOrder = transform.settledOrder;
     });
     this.syncSprites();
 
@@ -917,6 +957,22 @@ class StackingScene extends Phaser.Scene {
     if (this.activePiece !== null && this.canControlActivePiece()) this.updateActivePiece(delta);
     const remaining = Math.max(0, match.stacking.turnEndsAt - Date.now());
     this.timerText.setText((remaining / 1000).toFixed(1)).setColor(remaining <= 3_000 ? '#ff8d8d' : '#f5f2e8');
+  }
+
+  private updatePredictedDrop(delta: number) {
+    const prediction = this.predictedDrop;
+    if (prediction === null) return;
+    prediction.velocityY = Math.min(1_200, prediction.velocityY + (1_200 * delta) / 1000);
+    const transform = prediction.piece.networkTransform ?? {
+      angle: prediction.piece.body.rotation(),
+      x: prediction.piece.body.translation().x,
+      y: prediction.piece.body.translation().y,
+    };
+    prediction.piece.networkTransform = {
+      angle: transform.angle,
+      x: transform.x,
+      y: transform.y + (prediction.velocityY * delta) / 1000,
+    };
   }
 }
 
