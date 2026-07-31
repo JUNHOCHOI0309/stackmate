@@ -1,6 +1,9 @@
+import { loadProfile, type PlayerProfile } from './profile';
+
 export type RoomState = {
   match: MatchState | null;
   mode: 'match' | 'private';
+  opponentProfile?: PlayerProfile;
   players: Array<{ connected: boolean; id: string; slot: 'white' | 'black' }>;
   opponentRating?: number;
   inviteToken?: string | null;
@@ -32,6 +35,8 @@ type ServerMessage =
   | { type: 'connected'; clientId: string }
   | ({ type: 'room_state' } & RoomState)
   | { type: 'physics_snapshot'; revision: number; roomId: string; stacking: StackingState }
+  | { type: 'stacking_drop_sound'; roomId: string }
+  | { type: 'stacking_impact'; force: number; roomId: string }
   | { type: 'room_closed'; message: string }
   | { type: 'matchmaking_wait'; rating: number }
   | { type: 'error'; message: string }
@@ -53,6 +58,8 @@ export class MatchSocket {
   private pendingMessages: unknown[] = [];
   private room: RoomState | null = null;
   private roomListeners = new Set<(room: RoomState) => void>();
+  private stackingDropListeners = new Set<() => void>();
+  private stackingImpactListeners = new Set<(force: number) => void>();
   private readonly sessionId = getPersistentSessionId();
   private socket: WebSocket | null = null;
   private statusListeners = new Set<(status: string) => void>();
@@ -70,7 +77,7 @@ export class MatchSocket {
     this.publishStatus('연결 중…');
     this.socket = new WebSocket(endpoint);
     this.socket.addEventListener('open', () => {
-      this.socket?.send(JSON.stringify({ type: 'identify_session', sessionId: this.sessionId }));
+      this.socket?.send(JSON.stringify({ type: 'identify_session', profile: loadProfile(), sessionId: this.sessionId }));
       this.publishStatus('연결됨');
       this.pendingMessages.splice(0).forEach((message) => this.send(message));
     });
@@ -94,6 +101,16 @@ export class MatchSocket {
     return () => this.matchListeners.delete(listener);
   }
 
+  onStackingDrop(listener: () => void) {
+    this.stackingDropListeners.add(listener);
+    return () => this.stackingDropListeners.delete(listener);
+  }
+
+  onStackingImpact(listener: (force: number) => void) {
+    this.stackingImpactListeners.add(listener);
+    return () => this.stackingImpactListeners.delete(listener);
+  }
+
   getClientId() {
     return this.clientId;
   }
@@ -107,18 +124,22 @@ export class MatchSocket {
   }
 
   createPrivateRoom() {
+    this.syncProfile();
     this.send({ type: 'create_room' });
   }
 
   joinPrivateRoom(roomId: string) {
+    this.syncProfile();
     this.send({ type: 'join_room', roomId: roomId.trim().toUpperCase() });
   }
 
   joinPrivateInvite(token: string) {
+    this.syncProfile();
     this.send({ type: 'join_invite', token });
   }
 
   joinMatchmaking(rating: number) {
+    this.syncProfile();
     this.send({ type: 'join_matchmaking', rating });
     this.publishStatus(`레이팅 ${rating} 기준 상대 탐색 중…`);
   }
@@ -165,6 +186,10 @@ export class MatchSocket {
     this.send({ type: 'chess_forfeit', reason });
   }
 
+  syncProfile() {
+    this.send({ type: 'update_profile', profile: loadProfile() });
+  }
+
   private handleMessage(message: ServerMessage) {
     if (message.type === 'connected') {
       this.clientId = message.clientId;
@@ -192,6 +217,14 @@ export class MatchSocket {
       const match = { ...this.room.match, revision: message.revision, stacking: message.stacking };
       this.room = { ...this.room, match };
       this.matchListeners.forEach((listener) => listener(match));
+      return;
+    }
+    if (message.type === 'stacking_drop_sound') {
+      if (this.room?.roomId === message.roomId) this.stackingDropListeners.forEach((listener) => listener());
+      return;
+    }
+    if (message.type === 'stacking_impact') {
+      if (this.room?.roomId === message.roomId) this.stackingImpactListeners.forEach((listener) => listener(message.force));
       return;
     }
     if (message.type === 'room_closed') {

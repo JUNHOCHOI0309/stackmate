@@ -2,6 +2,7 @@ import Phaser from 'phaser';
 import RAPIER, { type RigidBody, type World } from '@dimforge/rapier2d-compat';
 import { Chess, type Color, type PieceSymbol, type Square } from 'chess.js';
 import { MenuScene } from './menu';
+import { MatchupScene } from './matchup';
 import { matchSocket, type MatchState, type StackingState } from './network';
 import { settleProfile, type GameMode } from './profile';
 import './style.css';
@@ -121,6 +122,8 @@ class StackingScene extends Phaser.Scene {
   private aiActionAt = 0;
   private activePiece: StackPiece | null = null;
   private decks: Record<PlayerColor, PieceKind[]> = { black: [], white: [] };
+  private impactEvents: RAPIER.EventQueue | null = null;
+  private lastImpactSoundAt = 0;
   private colorSelectionEndMs = 0;
   private colorSelectionWinner: PlayerColor | null = null;
   private gameEnded = false;
@@ -170,6 +173,9 @@ class StackingScene extends Phaser.Scene {
         this.load.image(this.sourceTextureKey(kind, color), `/assets/${kind}_${color}.png`);
       }
     }
+    this.load.audio('stack-drop', '/assets/sounds/droping_sound.m4a');
+    this.load.audio('stack-impact-1', '/assets/sounds/piece_crash_1.m4a');
+    this.load.audio('stack-impact-2', '/assets/sounds/piece_crash_2.m4a');
   }
 
   create() {
@@ -185,14 +191,31 @@ class StackingScene extends Phaser.Scene {
         if (match.phase === 'complete') this.showNetworkSettlement(match);
       }
     });
-    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.removeMatchListener?.());
+    const removeDropSoundListener = matchSocket.onStackingDrop(() => {
+      if (this.mode === 'multiplayer') this.playDropSound();
+    });
+    const removeImpactSoundListener = matchSocket.onStackingImpact((force) => {
+      if (this.mode === 'multiplayer') this.playImpactSound(force);
+    });
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      this.removeMatchListener?.();
+      removeDropSoundListener();
+      removeImpactSoundListener();
+      this.impactEvents?.free();
+      this.impactEvents = null;
+    });
     this.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
       if (this.activePiece !== null && !this.gameEnded && this.canControlActivePiece()) {
         this.targetX = Phaser.Math.Clamp(pointer.x, PLATFORM_CENTER_X - 250, PLATFORM_CENTER_X + 250);
       }
     });
-    this.input.on('pointerdown', () => {
-      if (this.canControlActivePiece()) this.dropActivePiece();
+    this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
+      if (!this.canControlActivePiece() || this.activePiece === null) return;
+      this.targetX = Phaser.Math.Clamp(pointer.x, PLATFORM_CENTER_X - 250, PLATFORM_CENTER_X + 250);
+      this.activePiece.body.setTranslation({ x: this.targetX, y: SPAWN_Y }, true);
+      this.activePiece.body.setRotation(this.activeAngle, true);
+      this.syncSprites();
+      this.dropActivePiece();
     });
     this.input.keyboard?.on('keydown-SPACE', () => {
       if (this.canControlActivePiece()) this.dropActivePiece();
@@ -220,7 +243,8 @@ class StackingScene extends Phaser.Scene {
     }
 
     if (!this.gameEnded || this.pendingFallLoser !== null) {
-      this.world.step();
+      this.world.step(this.impactEvents!);
+      if (this.mode === 'single') this.playLocalImpactSounds();
     }
     const fallenPieces = this.pieces.filter((piece) => (
       piece !== this.activePiece
@@ -323,7 +347,11 @@ class StackingScene extends Phaser.Scene {
     this.platformGraphics = graphics;
 
     const platform = this.world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(PLATFORM_CENTER_X, PLATFORM_Y));
-    const collider = RAPIER.ColliderDesc.cuboid(PLATFORM_HALF_WIDTH, 16).setFriction(0.62).setRestitution(0.32);
+    const collider = RAPIER.ColliderDesc.cuboid(PLATFORM_HALF_WIDTH, 16)
+      .setFriction(0.62)
+      .setRestitution(0.32)
+      .setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS)
+      .setContactForceEventThreshold(22);
     this.world.createCollider(collider, platform);
   }
 
@@ -383,7 +411,7 @@ class StackingScene extends Phaser.Scene {
       stroke: '#10131c',
       strokeThickness: 6,
     }).setDepth(30).setOrigin(0.5);
-    this.add.text(GAME_WIDTH / 2, GAME_HEIGHT - 12, '마우스 또는 ← →: 이동 · Q / E: 회전 · 클릭 또는 Space: 낙하 · R: 다시 시작', {
+    this.add.text(GAME_WIDTH / 2, GAME_HEIGHT - 12, '마우스 또는 ← →: 이동 · Q / E: 회전 · 클릭/터치/Space: 해당 위치에 낙하 · R: 다시 시작', {
       color: '#b9c4dd',
       fontFamily: 'system-ui, sans-serif',
       fontSize: '13px',
@@ -413,6 +441,7 @@ class StackingScene extends Phaser.Scene {
     this.lastDropped = this.activePiece;
     this.lastDroppedBy = this.activePiece.color;
     this.activePiece = null;
+    this.playDropSound();
     this.timerText.setText('—').setColor('#b9c4dd');
     this.statusText.setText(isAutomatic ? '시간 초과 · 현재 위치에서 자동 낙하' : '착지 안정화 확인 중…');
   }
@@ -597,7 +626,9 @@ class StackingScene extends Phaser.Scene {
     this.pieces.forEach((piece) => this.removePiece(piece));
     this.pieces = [];
     this.world?.free();
+    this.impactEvents?.free();
     this.world = new RAPIER.World({ x: 0, y: 400 });
+    this.impactEvents = new RAPIER.EventQueue(true);
     this.activePiece = null;
     this.activeAngle = 0;
     this.decks = {
@@ -653,6 +684,8 @@ class StackingScene extends Phaser.Scene {
         .setTranslation(x * SIDE_COLLIDER_SCALE, y)
         .setFriction(0.6)
         .setRestitution(0.234)
+        .setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS)
+        .setContactForceEventThreshold(22)
         .setDensity(0.72);
       this.world.createCollider(collider, body);
     };
@@ -661,6 +694,8 @@ class StackingScene extends Phaser.Scene {
         .setTranslation(x * SIDE_COLLIDER_SCALE, y)
         .setFriction(0.6)
         .setRestitution(0.252)
+        .setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS)
+        .setContactForceEventThreshold(22)
         .setDensity(0.72);
       this.world.createCollider(collider, body);
     };
@@ -669,6 +704,8 @@ class StackingScene extends Phaser.Scene {
         .setTranslation(x * SIDE_COLLIDER_SCALE, y)
         .setFriction(0.6)
         .setRestitution(0.252)
+        .setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS)
+        .setContactForceEventThreshold(22)
         .setDensity(0.72);
       this.world.createCollider(collider, body);
     };
@@ -679,7 +716,12 @@ class StackingScene extends Phaser.Scene {
         return;
       }
 
-      collider.setFriction(0.6).setRestitution(0.252).setDensity(0.72);
+      collider
+        .setFriction(0.6)
+        .setRestitution(0.252)
+        .setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS)
+        .setContactForceEventThreshold(22)
+        .setDensity(0.72);
       this.world.createCollider(collider, body);
     };
 
@@ -888,6 +930,24 @@ class StackingScene extends Phaser.Scene {
     return `piece-${kind}-${color}`;
   }
 
+  private playDropSound() {
+    this.sound.play('stack-drop', { volume: 0.52 });
+  }
+
+  private playImpactSound(force = 60) {
+    const now = performance.now();
+    if (now - this.lastImpactSoundAt < 110) return;
+    this.lastImpactSoundAt = now;
+    const volume = Phaser.Math.Clamp(0.2 + force / 500, 0.24, 0.58);
+    this.sound.play(Phaser.Math.Between(0, 1) === 0 ? 'stack-impact-1' : 'stack-impact-2', { volume });
+  }
+
+  private playLocalImpactSounds() {
+    this.impactEvents?.drainContactForceEvents((event) => {
+      this.playImpactSound(event.totalForceMagnitude());
+    });
+  }
+
   private updateTurnTimer(_delta: number) {
     const now = Date.now();
     const elapsed = now - this.lastTimerTickMs;
@@ -1031,6 +1091,8 @@ class ChessScene extends Phaser.Scene {
         this.load.svg(this.svgTextureKey(color, piece), `/assets/chess-svg/${color}${assetPiece}.svg`, { width: 90, height: 90 });
       });
     });
+    this.load.audio('chess-move', '/assets/sounds/chess-move.mp3');
+    this.load.audio('chess-capture', '/assets/sounds/chess-capture.mp3');
   }
 
   init(data: ChessStartData) {
@@ -1116,14 +1178,16 @@ class ChessScene extends Phaser.Scene {
   }
 
   private applyNetworkChessState(match: MatchState) {
-    if (match.phase === 'chess' && match.fen !== null && this.chess.fen() !== match.fen) {
+    if (match.fen !== null && this.chess.fen() !== match.fen) {
+      const previousPieceCount = this.pieceCount();
       this.chess = new Chess(match.fen);
       this.selectedSquare = null;
       this.selectedTargets = [];
       this.pendingPromotion = null;
       this.lastClockTickMs = Date.now();
+      this.playChessSound(this.pieceCount() < previousPieceCount ? 'capture' : 'move');
       this.renderBoard();
-      return;
+      if (match.phase === 'chess') return;
     }
     if (match.phase !== 'complete' || this.networkSettlementShown) return;
     this.networkSettlementShown = true;
@@ -1343,6 +1407,7 @@ class ChessScene extends Phaser.Scene {
     if (move.captured !== undefined) {
       this.capturedBy[turn].push(move.captured);
     }
+    this.playChessSound(move.captured === undefined ? 'move' : 'capture');
     this.clocks[turn] += CHESS_INCREMENT_MS;
     this.lastClockTickMs = Date.now();
     if (this.drawOfferBy !== null && this.drawOfferBy !== turn) {
@@ -1559,6 +1624,14 @@ class ChessScene extends Phaser.Scene {
     return `board-piece-${color}-${piece}`;
   }
 
+  private pieceCount() {
+    return this.chess.board().flat().filter((piece) => piece !== null).length;
+  }
+
+  private playChessSound(kind: 'capture' | 'move') {
+    this.sound.play(kind === 'capture' ? 'chess-capture' : 'chess-move', { volume: 0.42 });
+  }
+
   private updateClocks() {
     (['w', 'b'] as const).forEach((color) => {
       const totalSeconds = Math.ceil(this.clocks[color] / 1000);
@@ -1579,7 +1652,7 @@ async function start() {
     backgroundColor: '#10131c',
     width: GAME_WIDTH,
     height: GAME_HEIGHT,
-    scene: [MenuScene, StackingScene, ChessScene],
+    scene: [MenuScene, MatchupScene, StackingScene, ChessScene],
     scale: {
       // Display size is controlled by CSS. FIT mutates the canvas size during
       // window resizes, which can leave it stuck at a previously shrunken size.

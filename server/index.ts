@@ -10,9 +10,17 @@ type Client = {
   id: string;
   identified: boolean;
   joinAttemptKey: string;
+  profile: PlayerProfile;
   rating: number | null;
   roomId: string | null;
   socket: WebSocket;
+};
+
+type PlayerProfile = {
+  draws: number;
+  losses: number;
+  rating: number;
+  wins: number;
 };
 
 type ServerMatchState = {
@@ -41,7 +49,7 @@ type Room = {
 };
 
 type ClientMessage =
-  | { type: 'identify_session'; sessionId: string }
+  | { type: 'identify_session'; profile?: PlayerProfile; sessionId: string }
   | { type: 'create_room' }
   | { type: 'join_invite'; token: string }
   | { type: 'join_room'; roomId: string }
@@ -53,6 +61,7 @@ type ClientMessage =
   | { type: 'start_chess'; fen: string; whitePlayerId: string }
   | { type: 'chess_move'; from: string; promotion?: 'b' | 'n' | 'q' | 'r'; revision: number; to: string }
   | { type: 'chess_forfeit'; reason: 'resign' | 'timeout' }
+  | { type: 'update_profile'; profile: PlayerProfile }
   | { type: 'game_action'; action: unknown };
 
 const port = Number(process.env.PORT ?? process.env.WS_PORT ?? 8787);
@@ -75,6 +84,7 @@ const INVITE_TTL_MS = 30 * 60_000;
 const JOIN_ATTEMPT_LIMIT = 10;
 const JOIN_ATTEMPT_WINDOW_MS = 60_000;
 const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const DEFAULT_PROFILE: PlayerProfile = { draws: 0, losses: 0, rating: 1200, wins: 0 };
 const joinAttempts = new Map<string, number[]>();
 let lastJoinAttemptCleanupAt = 0;
 
@@ -139,6 +149,19 @@ function send(socket: WebSocket, message: unknown) {
   if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(message));
 }
 
+function normalizeProfile(profile: PlayerProfile | undefined): PlayerProfile {
+  if (profile === undefined) return { ...DEFAULT_PROFILE };
+  const safeNumber = (value: number, fallback: number, minimum = 0) => (
+    Number.isFinite(value) ? Math.max(minimum, Math.round(value)) : fallback
+  );
+  return {
+    draws: safeNumber(profile.draws, 0),
+    losses: safeNumber(profile.losses, 0),
+    rating: safeNumber(profile.rating, DEFAULT_PROFILE.rating, 100),
+    wins: safeNumber(profile.wins, 0),
+  };
+}
+
 function serializeMatchState(match: ServerMatchState | null) {
   if (match === null) return null;
   return {
@@ -160,6 +183,7 @@ function roomSnapshot(room: Room, recipient: Client) {
   return {
     match: serializeMatchState(room.match),
     mode: room.mode,
+    opponentProfile: opponent === undefined ? undefined : opponent.profile,
     opponentRating: opponent?.rating,
     inviteToken: room.mode === 'private' && recipient.id === room.hostId ? room.inviteToken : undefined,
     players: room.players.map((player, index) => ({ connected: player.disconnectedAt === null, id: player.id, slot: index === 0 ? 'white' : 'black' })),
@@ -175,6 +199,14 @@ function broadcastRoom(room: Room) {
 function broadcastPhysicsSnapshot(room: Room, match: ServerMatchState, stacking: StackingSnapshot) {
   const message = { type: 'physics_snapshot', roomId: room.id, revision: match.revision, stacking };
   room.players.forEach((player) => send(player.socket, message));
+}
+
+function broadcastStackingDropSound(room: Room) {
+  room.players.forEach((player) => send(player.socket, { roomId: room.id, type: 'stacking_drop_sound' }));
+}
+
+function broadcastStackingImpact(room: Room, force: number) {
+  room.players.forEach((player) => send(player.socket, { force, roomId: room.id, type: 'stacking_impact' }));
 }
 
 function createMatchState(room: Room): ServerMatchState {
@@ -265,10 +297,11 @@ function restoreRoomForSession(client: Client) {
   if (room !== undefined) joinRoom(client, room);
 }
 
-function identifySession(client: Client, sessionId: string) {
+function identifySession(client: Client, sessionId: string, profile?: PlayerProfile) {
   if (!isSessionId(sessionId)) return rejectAction(client, '유효하지 않은 세션입니다.');
   if (client.identified) return;
   client.id = sessionId;
+  client.profile = normalizeProfile(profile);
   client.identified = true;
   send(client.socket, { type: 'connected', clientId: client.id });
   restoreRoomForSession(client);
@@ -290,6 +323,7 @@ function joinPrivateInvite(client: Client, token: string) {
 function joinMatchmaking(client: Client, rating: number) {
   leaveRoom(client);
   client.rating = Math.max(100, Math.round(rating));
+  client.profile.rating = client.rating;
   const opponent = [...matchmakingQueue]
     .filter((candidate) => candidate.socket.readyState === candidate.socket.OPEN && candidate.rating !== null)
     .sort((a, b) => Math.abs((a.rating ?? 0) - client.rating!) - Math.abs((b.rating ?? 0) - client.rating!))[0];
@@ -323,6 +357,7 @@ function handleStackingDrop(client: Client, revision: number, x: number, angle: 
     return rejectAction(client, '현재 기물을 떨어뜨릴 수 없습니다.');
   }
   match.revision += 1;
+  broadcastStackingDropSound(room);
   broadcastRoom(room);
 }
 
@@ -504,6 +539,7 @@ wss.on('connection', (socket, request) => {
     id: createOpaqueToken(),
     identified: false,
     joinAttemptKey: requestAttemptKey(request),
+    profile: { ...DEFAULT_PROFILE },
     rating: null,
     roomId: null,
     socket,
@@ -513,7 +549,7 @@ wss.on('connection', (socket, request) => {
   socket.on('message', (data) => {
     const message = parseMessage(data);
     if (message === null) return rejectAction(client, '잘못된 메시지 형식입니다.');
-    if (message.type === 'identify_session') return identifySession(client, message.sessionId);
+    if (message.type === 'identify_session') return identifySession(client, message.sessionId, message.profile);
     if (!client.identified) return rejectAction(client, '세션 초기화 중입니다. 잠시 후 다시 시도하세요.');
     if (message.type === 'create_room') {
       const room = createPrivateRoom(client);
@@ -530,6 +566,13 @@ wss.on('connection', (socket, request) => {
         : joinRoom(client, room);
     }
     if (message.type === 'leave_room') return leaveRoom(client);
+    if (message.type === 'update_profile') {
+      client.profile = normalizeProfile(message.profile);
+      client.rating ??= client.profile.rating;
+      const room = getRoomForClient(client);
+      if (room !== undefined) broadcastRoom(room);
+      return;
+    }
     if (message.type === 'match_forfeit') return completeMatchForfeit(client, 'resign');
     if (message.type === 'stacking_drop') return handleStackingDrop(client, message.revision, message.x, message.angle);
     if (message.type === 'select_chess_color') return handleChessColorSelection(client, message.color);
@@ -589,6 +632,7 @@ setInterval(() => {
     }
     if (match?.phase !== 'stacking' || match.stacking === null) return;
     const result = match.stacking.tick(now);
+    if (result.impactForce > 0) broadcastStackingImpact(room, result.impactForce);
     if (result.outcome !== null) {
       const winnerId = playerForStackColor(room, result.outcome === 'white' ? 'black' : 'white')?.id ?? null;
       match.phase = 'color_selection';

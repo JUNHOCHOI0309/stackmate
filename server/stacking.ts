@@ -56,6 +56,7 @@ export class StackingSimulation {
   private active: { color: PlayerColor; kind: PieceKind } | null;
   private decks: Record<PlayerColor, PieceKind[]>;
   private droppingPiece: PhysicsPiece | null = null;
+  private impactEvents = new RAPIER.EventQueue(true);
   private lastSettledAt = 0;
   private nextPieceId = 1;
   private pieces = new Map<string, PhysicsPiece>();
@@ -67,12 +68,20 @@ export class StackingSimulation {
   constructor() {
     this.world = new RAPIER.World({ x: 0, y: 400 });
     const platform = this.world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(PLATFORM_CENTER_X, PLATFORM_Y));
-    this.world.createCollider(RAPIER.ColliderDesc.cuboid(PLATFORM_HALF_WIDTH, 16).setFriction(0.62).setRestitution(0.32), platform);
+    this.world.createCollider(
+      RAPIER.ColliderDesc.cuboid(PLATFORM_HALF_WIDTH, 16)
+        .setFriction(0.62)
+        .setRestitution(0.32)
+        .setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS)
+        .setContactForceEventThreshold(22),
+      platform,
+    );
     this.decks = { black: shuffledDeck(), white: shuffledDeck() };
     this.active = this.takeNextPiece();
   }
 
   destroy() {
+    this.impactEvents.free();
     this.world.free();
   }
 
@@ -113,14 +122,18 @@ export class StackingSimulation {
   tick(now: number) {
     if (this.droppingPiece === null && this.active !== null && now >= this.turnEndsAt) {
       this.drop(PLATFORM_CENTER_X, 0);
-      return { changed: true, outcome: null as PlayerColor | null };
+      return { changed: true, impactForce: 0, outcome: null as PlayerColor | null };
     }
-    if (this.droppingPiece === null) return { changed: false, outcome: null as PlayerColor | null };
+    if (this.droppingPiece === null) return { changed: false, impactForce: 0, outcome: null as PlayerColor | null };
 
-    this.world.step();
+    this.world.step(this.impactEvents);
+    let impactForce = 0;
+    this.impactEvents.drainContactForceEvents((event) => {
+      impactForce = Math.max(impactForce, event.totalForceMagnitude());
+    });
     const fallen = [...this.pieces.values()].find((piece) => piece.previousY <= FALL_LINE_Y && piece.body.translation().y > FALL_LINE_Y);
     this.pieces.forEach((piece) => { piece.previousY = piece.body.translation().y; });
-    if (fallen !== undefined) return { changed: true, outcome: fallen.color };
+    if (fallen !== undefined) return { changed: true, impactForce, outcome: fallen.color };
 
     const velocity = this.droppingPiece.body.linvel();
     const stable = Math.hypot(velocity.x, velocity.y) < 8 && Math.abs(this.droppingPiece.body.angvel()) < 0.12;
@@ -132,9 +145,9 @@ export class StackingSimulation {
       this.turn = this.turn === 'white' ? 'black' : 'white';
       this.active = this.takeNextPiece();
       this.turnEndsAt = now + TURN_DURATION_MS;
-      return { changed: true, outcome: null as PlayerColor | null };
+      return { changed: true, impactForce, outcome: null as PlayerColor | null };
     }
-    return { changed: false, outcome: null as PlayerColor | null };
+    return { changed: false, impactForce, outcome: null as PlayerColor | null };
   }
 
   private takeNextPiece() {
@@ -151,17 +164,17 @@ export class StackingSimulation {
 
   private addPieceColliders(body: RigidBody, kind: PieceKind, width: number, height: number) {
     const addCuboid = (halfWidth: number, halfHeight: number, x: number, y: number) => {
-      this.world.createCollider(RAPIER.ColliderDesc.cuboid(halfWidth * SIDE_COLLIDER_SCALE, halfHeight).setTranslation(x * SIDE_COLLIDER_SCALE, y).setFriction(0.6).setRestitution(0.234).setDensity(0.72), body);
+      this.world.createCollider(RAPIER.ColliderDesc.cuboid(halfWidth * SIDE_COLLIDER_SCALE, halfHeight).setTranslation(x * SIDE_COLLIDER_SCALE, y).setFriction(0.6).setRestitution(0.234).setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS).setContactForceEventThreshold(22).setDensity(0.72), body);
     };
     const addBall = (radius: number, x: number, y: number) => {
-      this.world.createCollider(RAPIER.ColliderDesc.ball(radius * 1.06).setTranslation(x * SIDE_COLLIDER_SCALE, y).setFriction(0.6).setRestitution(0.252).setDensity(0.72), body);
+      this.world.createCollider(RAPIER.ColliderDesc.ball(radius * 1.06).setTranslation(x * SIDE_COLLIDER_SCALE, y).setFriction(0.6).setRestitution(0.252).setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS).setContactForceEventThreshold(22).setDensity(0.72), body);
     };
     const addCapsule = (halfHeight: number, radius: number, x: number, y: number) => {
-      this.world.createCollider(RAPIER.ColliderDesc.capsule(halfHeight, radius * SIDE_COLLIDER_SCALE).setTranslation(x * SIDE_COLLIDER_SCALE, y).setFriction(0.6).setRestitution(0.252).setDensity(0.72), body);
+      this.world.createCollider(RAPIER.ColliderDesc.capsule(halfHeight, radius * SIDE_COLLIDER_SCALE).setTranslation(x * SIDE_COLLIDER_SCALE, y).setFriction(0.6).setRestitution(0.252).setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS).setContactForceEventThreshold(22).setDensity(0.72), body);
     };
     const addConvex = (points: Array<[number, number]>) => {
       const collider = RAPIER.ColliderDesc.convexHull(new Float32Array(points.flatMap(([x, y]) => [x * SIDE_COLLIDER_SCALE, y])));
-      if (collider !== null) this.world.createCollider(collider.setFriction(0.6).setRestitution(0.252).setDensity(0.72), body);
+      if (collider !== null) this.world.createCollider(collider.setFriction(0.6).setRestitution(0.252).setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS).setContactForceEventThreshold(22).setDensity(0.72), body);
     };
 
     addCuboid(width * 0.42, height * 0.08, 0, height * 0.38);

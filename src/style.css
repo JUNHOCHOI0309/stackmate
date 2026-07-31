@@ -2,6 +2,7 @@
   color: #f5f7ff;
   background: #10131c;
   font-family: system-ui, sans-serif;
+  touch-action: manipulation;
 }
 
 * {
@@ -9,16 +10,19 @@
 }
 
 body {
-  min-width: 320px;
-  min-height: 100vh;
+  min-width: 0;
+  min-height: 100dvh;
   margin: 0;
-  overflow: auto;
+  overflow: hidden;
   background: radial-gradient(circle at top, #202947, #10131c 60%);
+  overscroll-behavior: none;
+  display: grid;
+  place-items: center;
 }
 
 #app {
-  width: min(100vw, 1450px);
-  margin: 0 auto;
+  width: min(100vw, 1450px, 138.0952dvh);
+  aspect-ratio: 1160 / 840;
   border: 1px solid #323c59;
   box-shadow: 0 24px 80px rgb(0 0 0 / 35%);
 }
@@ -26,5 +30,35 @@ body {
 canvas {
   display: block;
   width: 100%;
-  height: auto;
+  height: 100%;
+  touch-action: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+}
+
+@media (width <= 767px) {
+  body {
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+
+  #app {
+    border: 0;
+    box-shadow: none;
+  }
+}
+
+@media (width <= 767px) and (orientation: portrait) {
+  body::after {
+    content: '가로 모드에서 더 넓고 편하게 플레이할 수 있습니다';
+    position: fixed;
+    top: calc(env(safe-area-inset-top) + 8px);
+    left: 50%;
+    z-index: 2;
+    color: #b9c4dd;
+    font-size: 12px;
+    pointer-events: none;
+    transform: translateX(-50%);
+    white-space: nowrap;
+  }
 }

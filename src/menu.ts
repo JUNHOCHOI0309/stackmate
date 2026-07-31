@@ -1,12 +1,13 @@
 import Phaser from 'phaser';
 import { matchSocket, type RoomState } from './network';
-import { loadProfile, type GameMode } from './profile';
+import { loadProfile, type GameMode, type PlayerProfile } from './profile';
 
 const GAME_WIDTH = 1160;
 const GAME_HEIGHT = 840;
 
 type MatchStartData = {
   mode: GameMode;
+  opponentProfile?: PlayerProfile;
   opponentRating?: number;
 };
 
@@ -83,7 +84,11 @@ export class MenuScene extends Phaser.Scene {
     }
     if (room.ready && !this.startingGame) {
       this.startingGame = true;
-      this.time.delayedCall(650, () => this.startGame({ mode: 'multiplayer', opponentRating: room.opponentRating }));
+      this.time.delayedCall(650, () => this.startGame({
+        mode: 'multiplayer',
+        opponentProfile: room.opponentProfile,
+        opponentRating: room.opponentRating,
+      }));
     }
   }
 
@@ -128,6 +133,6 @@ export class MenuScene extends Phaser.Scene {
   }
 
   private startGame(data: MatchStartData) {
-    this.scene.start('stacking', data);
+    this.scene.start('matchup', data);
   }
 }
