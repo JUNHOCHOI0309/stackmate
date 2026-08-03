@@ -1,18 +1,18 @@
 # 배포 및 친구 초대 테스트
 
-## 권장 시범 구조
+> 이 문서는 기존 웹 배포 환경을 정리한 기록이다. 현재 배포 채널은 Tauri 데스크톱 앱과 Capacitor 모바일 앱이며, 자세한 절차는 [19_NATIVE_DISTRIBUTION.md](19_NATIVE_DISTRIBUTION.md)를 따른다.
+
+## 현재 구조
 
 ```text
-Cloudflare Pages (Vite 정적 파일)
-        |
-        | WSS: VITE_WS_URL
-        v
-Node WebSocket 서버 (Docker: Fly.io / Render / Railway 등)
+Tauri Windows 앱 / Capacitor 모바일 앱
+                 |
+                 | WSS: VITE_WS_URL
+                 v
+Render Node WebSocket 서버
 ```
 
-Pages는 정적 클라이언트를 배포하고, 방 코드·매칭·실시간 상태와 서버 권위 물리는 별도 WebSocket 서버가 처리한다. 시범 단계에서는 이 Node 서버를 별도 컨테이너로 유지한다.
-
-Cloudflare만으로 구성할 수도 있지만, 그 경우 Pages 외에 **Worker + Durable Object**를 별도 배포해야 한다. Pages 프로젝트 내부에서 Durable Object를 직접 생성할 수는 없다. Durable Object는 방별 WebSocket 연결을 조정하는 용도로 적합하지만, 지속적인 물리 틱을 운영하기 전에 Worker CPU/비용 모델을 별도로 검토한다.
+방 코드·매칭·실시간 상태와 서버 권위 물리는 Render의 Node WebSocket 서버가 처리한다. 이번 전환에서는 Render 서버를 유지하고, 기존 Cloudflare Pages 정적 클라이언트만 회수한다.
 
 ## Docker는 무엇인가
 
@@ -22,8 +22,8 @@ Docker는 별도의 서버나 API가 아니라, 서버 프로그램과 실행 �
 
 ```text
 Dockerfile → WebSocket 서버 실행 이미지를 만듦
-Fly.io / Render / Railway → 그 이미지를 인터넷에서 계속 실행함
-Cloudflare Pages → 브라우저용 정적 파일을 배포함
+Render → 그 이미지를 인터넷에서 계속 실행함
+Tauri / Capacitor → 동일한 Vite 클라이언트를 설치형 앱으로 배포함
 ```
 
 Docker 이미지는 API 서버뿐 아니라 데이터 처리 작업, 프록시, 게임 서버 등 어떤 프로그램도 실행할 수 있다. Stackmate에서는 REST API가 아니라 장시간 연결을 유지하는 WebSocket 게임 서버를 컨테이너로 실행한다.
@@ -81,11 +81,6 @@ docker run --rm -p 8787:8787 -e WS_PORT=8787 stackmate-ws
 
 배포 플랫폼의 포트 환경 변수에 맞춰 `WS_PORT`를 지정한다. `GET /health`는 200과 `{"status":"ok"}`를 반환한다.
 
-## Cloudflare Pages
+## 기존 Cloudflare Pages 회수
 
-1. Git 저장소를 Pages 프로젝트에 연결한다.
-2. Build command는 `npm run build`, output directory는 `dist`로 설정한다.
-3. Pages 환경 변수 `VITE_WS_URL`에 배포한 서버의 `wss://...` 주소를 입력한다.
-4. 다시 빌드·배포한다. `VITE_` 변수는 브라우저 번들에 공개되므로 비밀값을 넣지 않는다.
-
-배포 후 방을 만들고 초대 링크를 친구에게 보내면, 두 브라우저가 같은 WebSocket 방에 연결된다.
+새 Tauri·Capacitor 빌드에서 방 생성·초대 링크·재접속·멀티 쌓기·체스 완료를 확인한 뒤, Cloudflare Dashboard에서 기존 Pages 프로젝트와 연결된 커스텀 도메인만 삭제한다. Render WebSocket 서버는 이 과정의 대상이 아니다.
